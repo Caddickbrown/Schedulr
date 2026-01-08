@@ -867,6 +867,49 @@ class DailyPlanOptimizerProgressive:
             else:
                 day['avg_difficulty'] = 0
         
+        # ============================================
+        # PHASE 6: Sort Days by Earliest Order Date
+        # ============================================
+        # Renumber days so that the day with the earliest order date comes first
+        print(f"\n--- Phase 6: Sort Days by Earliest Order Date ---")
+        
+        # Calculate earliest order date for each day
+        for day in days:
+            earliest_date = None
+            for order in day['orders']:
+                order_date = order.get('Start Date')
+                if order_date and order_date != datetime.max:
+                    if earliest_date is None or order_date < earliest_date:
+                        earliest_date = order_date
+            day['earliest_order_date'] = earliest_date or datetime.max
+        
+        # Print before sorting
+        print("  Before sorting:")
+        for day in days:
+            earliest = day['earliest_order_date']
+            date_str = earliest.strftime('%Y-%m-%d') if earliest != datetime.max else 'N/A'
+            print(f"    Day {day['day']}: earliest order = {date_str}")
+        
+        # Sort days by earliest order date
+        days.sort(key=lambda d: d['earliest_order_date'])
+        
+        # Renumber the days
+        for i, day in enumerate(days, 1):
+            day['day'] = i
+            day['day_label'] = f"Day {i}"
+        
+        # Print after sorting
+        print("  After sorting:")
+        for day in days:
+            earliest = day['earliest_order_date']
+            date_str = earliest.strftime('%Y-%m-%d') if earliest != datetime.max else 'N/A'
+            print(f"    Day {day['day']}: earliest order = {date_str}")
+        
+        # Clean up the temporary field
+        for day in days:
+            if 'earliest_order_date' in day:
+                del day['earliest_order_date']
+        
         # Print final summary
         print(f"\n{'='*60}")
         print("FINAL DISTRIBUTION:")
