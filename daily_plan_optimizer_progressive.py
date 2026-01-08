@@ -150,6 +150,19 @@ class DailyPlanOptimizerProgressive:
                 else:
                     parsed_date = None
                 
+                # Load efficiency metrics for difficulty classification
+                qty_hr = self._parse_float(row_dict.get('Qty/Hr', 0))
+                picks_hr = self._parse_float(row_dict.get('Picks/Hr', 0))
+                picks_qty = self._parse_float(row_dict.get('Picks/Qty', 0))
+                
+                # Calculate if not present in data
+                if qty_hr == 0 and hours > 0:
+                    qty_hr = qty / hours
+                if picks_hr == 0 and hours > 0:
+                    picks_hr = picks / hours
+                if picks_qty == 0 and qty > 0:
+                    picks_qty = picks / qty
+                
                 order = {
                     'Order No': str(row_dict.get('Order No', '')).strip(),
                     'Part No': str(row_dict.get('Part No', '')).strip(),
@@ -162,6 +175,9 @@ class DailyPlanOptimizerProgressive:
                     'Wrap Type': str(row_dict.get('Wrap Type', '')).strip(),
                     'CPU': self._parse_float(row_dict.get('CPU', 0)),
                     'Suggested Line': suggested_line,
+                    'Qty/Hr': qty_hr,
+                    'Picks/Hr': picks_hr,
+                    'Picks/Qty': picks_qty,
                 }
                 
                 if order['Order No'] and order['Part No'] and order['Lot Size'] > 0:
