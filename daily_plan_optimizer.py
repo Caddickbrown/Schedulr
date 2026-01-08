@@ -892,6 +892,7 @@ class DailyPlanOptimizer:
     def generate_multi_day_plans(self, num_days: int, brand: str = None) -> List[Dict]:
         """
         Generate multi-day plans with balanced utilization across days.
+        Levels picks, orders, quantity, and hours across all days to create "average days".
         
         Args:
             num_days: Number of days to plan
@@ -912,8 +913,9 @@ class DailyPlanOptimizer:
         if not brand_orders:
             return []
         
-        hours_target = limits['Hours']
-        target_orders_per_day = 40
+        hours_limit = limits['Hours']
+        picks_limit = limits['Picks']
+        qty_limit = limits['Qty']
         
         # Prepare orders with metrics
         orders_with_metrics = []
@@ -947,7 +949,25 @@ class DailyPlanOptimizer:
                     'difficulty': difficulty
                 })
         
-        # Sort by date priority
+        # Calculate total work and average targets per day
+        total_hours = sum(item['hours'] for item in orders_with_metrics)
+        total_picks = sum(item['picks'] for item in orders_with_metrics)
+        total_qty = sum(item['qty'] for item in orders_with_metrics)
+        total_orders = len(orders_with_metrics)
+        
+        # Calculate average targets per day (targeting utilization of limits)
+        avg_hours_per_day = min(total_hours / num_days, hours_limit)
+        avg_picks_per_day = min(total_picks / num_days, picks_limit)
+        avg_qty_per_day = min(total_qty / num_days, qty_limit)
+        avg_orders_per_day = total_orders / num_days
+        
+        print(f"\nLeveling targets per day:")
+        print(f"  Hours: {avg_hours_per_day:.1f} (limit: {hours_limit})")
+        print(f"  Picks: {avg_picks_per_day:.1f} (limit: {picks_limit})")
+        print(f"  Qty: {avg_qty_per_day:.1f} (limit: {qty_limit})")
+        print(f"  Orders: {avg_orders_per_day:.1f}")
+        
+        # Sort by date priority (earlier dates first)
         orders_with_metrics.sort(key=lambda x: (x['start_date'], -x['hours']))
         
         # Initialize days with line tracking
@@ -987,12 +1007,12 @@ class DailyPlanOptimizer:
                         hours = item['hours']
                         
                         # Check basic constraints
-                        if (day['totals']['Hours'] + hours > hours_target * 1.1 or
-                            day['totals']['Qty'] + qty > limits['Qty'] * 2.0 or
-                            day['totals']['Picks'] + picks > limits['Picks'] * 2.0):
+                        if (day['totals']['Hours'] + hours > hours_limit * 1.1 or
+                            day['totals']['Qty'] + qty > qty_limit * 1.5 or
+                            day['totals']['Picks'] + picks > picks_limit * 1.5):
                             continue
                         
-                        # Score: prefer smaller hours to leave room for more orders
+                        # Score: prefer smaller orders to leave room for more
                         score = -hours + item['date_priority'] * 10
                         
                         if score > best_score:
@@ -1013,139 +1033,168 @@ class DailyPlanOptimizer:
                         day['difficulty_counts'][order_difficulty] += 1
                         remaining_orders.remove(best_for_line)
         
-        # Fill each day sequentially to 100% before moving to next day
-        # This ensures each day reaches the hours target
-        completed_days = []
+        # Phase 1: Level all metrics across days using round-robin with scoring
+        # Distribute orders to balance hours, picks, orders, and qty across days
+        max_iterations = len(remaining_orders) * 10
+        iteration = 0
         
-        for day_idx, day in enumerate(days):
-            if not remaining_orders:
+        while remaining_orders and iteration < max_iterations:
+            iteration += 1
+            
+            # Find the day that needs the most work (furthest below average)
+            best_day_idx = None
+            best_day_score = float('inf')
+            
+            for day_idx, day in enumerate(days):
+                # Calculate how far below average this day is for each metric
+                hours_deficit = max(0, avg_hours_per_day - day['totals']['Hours'])
+                picks_deficit = max(0, avg_picks_per_day - day['totals']['Picks'])
+                qty_deficit = max(0, avg_qty_per_day - day['totals']['Qty'])
+                orders_deficit = max(0, avg_orders_per_day - day['num_orders'])
+                
+                # Weighted score: prioritize picks and orders leveling
+                # Picks get highest weight (user complaint: not using 750 limit early)
+                # Orders get high weight (user complaint: only 9 orders on Day 1)
+                score = (hours_deficit * 1.0 + 
+                        picks_deficit * 3.0 +  # Strong weight on picks
+                        qty_deficit * 1.0 + 
+                        orders_deficit * 2.5)  # Strong weight on orders
+                
+                if score < best_day_score:
+                    best_day_score = score
+                    best_day_idx = day_idx
+            
+            if best_day_idx is None:
                 break
             
-            # Use the single-day optimizer to fill this day to 100%
-            # Create a temporary optimizer with only remaining orders
-            temp_orders = [item['order'] for item in remaining_orders]
+            day = days[best_day_idx]
             
-            # Use optimize_plan_balanced to fill this day
-            # We'll manually track and add orders to this day
-            day_hours_target = hours_target
-            day_selected = []
-            day_totals = {'Qty': day['totals']['Qty'], 'Picks': day['totals']['Picks'], 'Hours': day['totals']['Hours']}
-            day_line_counts = day['line_counts'].copy()
-            day_line_hours = day['line_hours'].copy()
-            day_offline_count = day['offline_count']
-            day_difficulty_counts = day['difficulty_counts'].copy()
+            # Find best order for this day that helps level all metrics
+            best_order = None
+            best_score = -float('inf')
             
-            # Continue adding orders until we reach at least 99.5% of hours target
-            max_iterations = len(remaining_orders) * 3
-            iteration = 0
-            
-            while remaining_orders and day_totals['Hours'] < day_hours_target * 0.995 and iteration < max_iterations:
-                iteration += 1
+            for item in remaining_orders:
+                qty = item['qty']
+                picks = item['picks']
+                hours = item['hours']
                 
-                best_order = None
-                best_score = -float('inf')
+                # Check hard limits
+                new_hours = day['totals']['Hours'] + hours
+                new_picks = day['totals']['Picks'] + picks
+                new_qty = day['totals']['Qty'] + qty
                 
-                for item in remaining_orders:
-                    qty = item['qty']
-                    picks = item['picks']
-                    hours = item['hours']
-                    
-                    # Check if adding this order would exceed limits
-                    new_hours = day_totals['Hours'] + hours
-                    if new_hours > day_hours_target * 1.02:  # Max 2% over
-                        continue
-                    
-                    # Check Offline Jobs limit
-                    order_line_raw = item['order'].get('Suggested Line', '').strip()
-                    is_offline = order_line_raw.upper() == 'OFFLINE'
-                    if is_offline and day_offline_count >= offline_limit:
-                        continue
-                    
-                    # Check Qty/Picks limits (flexible up to 50% over)
-                    if (day_totals['Qty'] + qty > limits['Qty'] * 1.5 or
-                        day_totals['Picks'] + picks > limits['Picks'] * 1.5):
-                        continue
-                    
-                    # Score: prioritize getting closer to hours target
-                    current_distance = abs(day_hours_target - day_totals['Hours'])
-                    new_distance = abs(day_hours_target - new_hours)
-                    hours_improvement = current_distance - new_distance
-                    
-                    # Strongly prefer orders that get us closer to 100%
-                    score = hours_improvement * 100
-                    
-                    # Bonus for line balance
-                    order_line = self._get_line_category(item['order'].get('Suggested Line', ''))
-                    if order_line in ['C1', 'C2', 'C3/4']:
-                        if day_line_counts[order_line] == 0:
-                            score += 50  # Strong bonus for first order in a line
-                    
-                    # Bonus for difficulty blending
-                    order_difficulty = item.get('difficulty', 'Medium')
-                    if day_totals['Hours'] > 0:
-                        total_selected = len(day_selected)
-                        if total_selected > 0:
-                            easy_ratio = day_difficulty_counts['Easy'] / total_selected
-                            difficult_ratio = day_difficulty_counts['Difficult'] / total_selected
-                            if order_difficulty == 'Difficult' and difficult_ratio < 0.3:
-                                score += 20  # Bonus for difficult orders if underrepresented
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_order = item
+                # Don't exceed limits (allow small overage for picks/qty if needed)
+                if new_hours > hours_limit * 1.05:  # Max 5% over on hours
+                    continue
+                if new_picks > picks_limit * 1.2:  # Max 20% over on picks (use the limit!)
+                    continue
+                if new_qty > qty_limit * 1.2:  # Max 20% over on qty
+                    continue
                 
-                if best_order:
-                    # Add order to day
-                    day_selected.append(best_order['order'])
-                    day_totals['Qty'] += best_order['qty']
-                    day_totals['Picks'] += best_order['picks']
-                    day_totals['Hours'] += best_order['hours']
-                    
-                    order_line = self._get_line_category(best_order['order'].get('Suggested Line', ''))
-                    day_line_counts[order_line] += 1
-                    day_line_hours[order_line] += best_order['hours']
-                    
-                    order_difficulty = best_order.get('difficulty', 'Medium')
-                    day_difficulty_counts[order_difficulty] += 1
-                    
-                    order_line_raw = best_order['order'].get('Suggested Line', '').strip()
-                    if order_line_raw.upper() == 'OFFLINE':
-                        day_offline_count += 1
-                    
-                    remaining_orders.remove(best_order)
-                else:
-                    # Can't add more orders to this day
-                    break
+                # Check Offline Jobs limit
+                order_line_raw = item['order'].get('Suggested Line', '').strip()
+                is_offline = order_line_raw.upper() == 'OFFLINE'
+                if is_offline and day['offline_count'] >= offline_limit:
+                    continue
+                
+                # Score: how well does this order help level all metrics?
+                current_hours_deficit = max(0, avg_hours_per_day - day['totals']['Hours'])
+                current_picks_deficit = max(0, avg_picks_per_day - day['totals']['Picks'])
+                current_qty_deficit = max(0, avg_qty_per_day - day['totals']['Qty'])
+                current_orders_deficit = max(0, avg_orders_per_day - day['num_orders'])
+                
+                new_hours_deficit = max(0, avg_hours_per_day - new_hours)
+                new_picks_deficit = max(0, avg_picks_per_day - new_picks)
+                new_qty_deficit = max(0, avg_qty_per_day - new_qty)
+                new_orders_deficit = max(0, avg_orders_per_day - (day['num_orders'] + 1))
+                
+                # Calculate improvement (reduction in deficit)
+                hours_improvement = current_hours_deficit - new_hours_deficit
+                picks_improvement = current_picks_deficit - new_picks_deficit
+                qty_improvement = current_qty_deficit - new_qty_deficit
+                orders_improvement = current_orders_deficit - new_orders_deficit
+                
+                # Weighted score: prioritize picks and orders leveling
+                score = (hours_improvement * 1.0 + 
+                        picks_improvement * 3.0 +  # Strong weight on picks
+                        qty_improvement * 1.0 + 
+                        orders_improvement * 2.5)  # Strong weight on orders
+                
+                # Bonus for date priority (earlier dates)
+                score += item['date_priority'] * 5
+                
+                # Bonus for line balance
+                order_line = self._get_line_category(item['order'].get('Suggested Line', ''))
+                if order_line in ['C1', 'C2', 'C3/4']:
+                    target_lines = ['C1', 'C2', 'C3/4']
+                    if day['line_counts'][order_line] == 0:
+                        score += 30  # Bonus for first order in a line
+                    else:
+                        # Check if this line is underrepresented
+                        total_line_orders = sum(day['line_counts'][line] for line in target_lines)
+                        if total_line_orders > 0:
+                            line_ratio = day['line_counts'][order_line] / total_line_orders
+                            target_ratio = 1.0 / 3.0
+                            if line_ratio < target_ratio * 0.8:
+                                score += 15  # Bonus for underrepresented lines
+                
+                # Bonus for difficulty blending
+                order_difficulty = item.get('difficulty', 'Medium')
+                if day['num_orders'] > 0:
+                    easy_ratio = day['difficulty_counts']['Easy'] / day['num_orders']
+                    difficult_ratio = day['difficulty_counts']['Difficult'] / day['num_orders']
+                    if order_difficulty == 'Difficult' and difficult_ratio < 0.3:
+                        score += 10  # Bonus for difficult orders if underrepresented
+                
+                # Penalty if this would push us too far over average
+                if new_hours > avg_hours_per_day * 1.2:
+                    score -= 20  # Penalty for going too far over
+                if new_picks > avg_picks_per_day * 1.2:
+                    score -= 20
+                if new_qty > avg_qty_per_day * 1.2:
+                    score -= 20
+                
+                if score > best_score:
+                    best_score = score
+                    best_order = item
             
-            # Update day with final totals
-            day['orders'].extend(day_selected)
-            day['totals'] = day_totals
-            day['num_orders'] = len(day['orders'])
-            day['line_counts'] = day_line_counts
-            day['line_hours'] = day_line_hours
-            day['offline_count'] = day_offline_count
-            day['difficulty_counts'] = day_difficulty_counts
+            if best_order:
+                # Add order to day
+                day['orders'].append(best_order['order'])
+                day['totals']['Qty'] += best_order['qty']
+                day['totals']['Picks'] += best_order['picks']
+                day['totals']['Hours'] += best_order['hours']
+                day['num_orders'] += 1
+                
+                order_line = self._get_line_category(best_order['order'].get('Suggested Line', ''))
+                day['line_counts'][order_line] += 1
+                day['line_hours'][order_line] += best_order['hours']
+                
+                order_difficulty = best_order.get('difficulty', 'Medium')
+                day['difficulty_counts'][order_difficulty] += 1
+                
+                order_line_raw = best_order['order'].get('Suggested Line', '').strip()
+                if order_line_raw.upper() == 'OFFLINE':
+                    day['offline_count'] += 1
+                
+                remaining_orders.remove(best_order)
+            else:
+                # Can't add more orders to any day - stop
+                break
+        
+        # Finalize all days
+        completed_days = []
+        for day in days:
             day['utilization'] = {
-                'Qty': day_totals['Qty'] / limits['Qty'] * 100 if limits['Qty'] > 0 else 0,
-                'Picks': day_totals['Picks'] / limits['Picks'] * 100 if limits['Picks'] > 0 else 0,
-                'Hours': day_totals['Hours'] / limits['Hours'] * 100 if limits['Hours'] > 0 else 0
+                'Qty': day['totals']['Qty'] / qty_limit * 100 if qty_limit > 0 else 0,
+                'Picks': day['totals']['Picks'] / picks_limit * 100 if picks_limit > 0 else 0,
+                'Hours': day['totals']['Hours'] / hours_limit * 100 if hours_limit > 0 else 0
             }
             
-            # Only keep days that reached at least 50% of hours target
-            if day_totals['Hours'] >= day_hours_target * 0.5:
+            # Keep days that have at least some work
+            if day['num_orders'] > 0:
                 completed_days.append(day)
-            else:
-                # Put orders back and stop
-                for order in day_selected:
-                    # Find the original item in remaining_orders
-                    for orig_item in orders_with_metrics:
-                        if orig_item['order']['Order No'] == order.get('Order No'):
-                            if orig_item not in remaining_orders:
-                                remaining_orders.append(orig_item)
-                            break
-                break
         
-        # Replace days with completed days
         days = completed_days
         
         # Create Remainder with all leftover orders
@@ -1159,9 +1208,9 @@ class DailyPlanOptimizer:
                     'Hours': sum(item['hours'] for item in remaining_orders)
                 },
                 'utilization': {
-                    'Qty': sum(item['qty'] for item in remaining_orders) / limits['Qty'] * 100 if limits['Qty'] > 0 else 0,
-                    'Picks': sum(item['picks'] for item in remaining_orders) / limits['Picks'] * 100 if limits['Picks'] > 0 else 0,
-                    'Hours': sum(item['hours'] for item in remaining_orders) / limits['Hours'] * 100 if limits['Hours'] > 0 else 0
+                    'Qty': sum(item['qty'] for item in remaining_orders) / qty_limit * 100 if qty_limit > 0 else 0,
+                    'Picks': sum(item['picks'] for item in remaining_orders) / picks_limit * 100 if picks_limit > 0 else 0,
+                    'Hours': sum(item['hours'] for item in remaining_orders) / hours_limit * 100 if hours_limit > 0 else 0
                 },
                 'num_orders': len(remaining_orders),
                 'line_counts': {'C1': 0, 'C2': 0, 'C3/4': 0, 'Other': 0},
