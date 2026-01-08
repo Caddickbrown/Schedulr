@@ -873,19 +873,30 @@ class DailyPlanOptimizerProgressive:
         # PHASE 6: Sort Days by Weighted Late Order Priority
         # ============================================
         # Only LATE orders (past start date) contribute to priority
-        # Priority = sum of (days_late × qty_weight) for late orders only
+        # Priority = sum of (days_late × qty_weight) + (days_late × lateness_bonus)
         # - Days late: how many days past start date
         # - Qty weight: order qty as % of day's total qty (bigger late orders matter more)
+        # - Lateness bonus: ensures very late orders get priority even if small
         # Higher priority score = should be done first
         print(f"\n--- Phase 6: Sort Days by Weighted Late Order Priority ---")
         
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         print(f"  Reference date (today): {today.strftime('%Y-%m-%d')}")
         
+        # LATENESS_BONUS_FACTOR: How much to weight lateness independent of order size
+        # Higher value = lateness matters more regardless of order size
+        # 0.0 = only size-weighted lateness matters
+        # 0.1 = adds 10% of lateness as bonus (e.g., 37 days late adds 3.7 to priority)
+        # 0.2 = adds 20% of lateness as bonus (e.g., 37 days late adds 7.4 to priority)
+        LATENESS_BONUS_FACTOR = 0.15
+        
+        print(f"  Lateness bonus factor: {LATENESS_BONUS_FACTOR} (higher = lateness matters more)")
+        
         # Calculate weighted priority score for each day (only from LATE orders)
         for day in days:
             day_total_qty = day['totals']['Qty']
             weighted_priority = 0.0
+            lateness_bonus_total = 0.0
             max_lateness = 0
             late_order_count = 0
             late_order_qty = 0
@@ -910,11 +921,18 @@ class DailyPlanOptimizerProgressive:
                         # Calculate qty weight (order qty as % of day total)
                         qty_weight = order_qty / day_total_qty if day_total_qty > 0 else 0
                         
-                        # Weighted contribution: days_late × qty_weight
-                        # Orders that are more overdue AND bigger contribute more
-                        weighted_priority += lateness_days * qty_weight
+                        # Size-weighted contribution: days_late × qty_weight
+                        size_weighted = lateness_days * qty_weight
+                        
+                        # Lateness bonus: ensures very late orders get priority even if small
+                        # This adds priority based purely on how late, regardless of size
+                        lateness_bonus = lateness_days * LATENESS_BONUS_FACTOR
+                        
+                        weighted_priority += size_weighted + lateness_bonus
+                        lateness_bonus_total += lateness_bonus
             
             day['weighted_priority'] = weighted_priority
+            day['lateness_bonus'] = lateness_bonus_total
             day['max_lateness_days'] = max_lateness
             day['late_order_count'] = late_order_count
             day['late_order_qty_pct'] = (late_order_qty / day_total_qty * 100) if day_total_qty > 0 else 0
@@ -922,7 +940,8 @@ class DailyPlanOptimizerProgressive:
         # Print before sorting
         print("  Before sorting:")
         for day in days:
-            print(f"    Day {day['day']}: priority={day['weighted_priority']:.1f}, "
+            print(f"    Day {day['day']}: priority={day['weighted_priority']:.1f} "
+                  f"(lateness_bonus={day['lateness_bonus']:.1f}), "
                   f"late_orders={day['late_order_count']} ({day['late_order_qty_pct']:.1f}% of qty), "
                   f"max_late={day['max_lateness_days']}d")
         
@@ -942,7 +961,7 @@ class DailyPlanOptimizerProgressive:
         
         # Clean up the temporary fields
         for day in days:
-            for field in ['weighted_priority', 'max_lateness_days', 'late_order_count', 'late_order_qty_pct']:
+            for field in ['weighted_priority', 'lateness_bonus', 'max_lateness_days', 'late_order_count', 'late_order_qty_pct']:
                 if field in day:
                     del day[field]
         
