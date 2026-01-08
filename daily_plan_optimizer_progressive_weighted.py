@@ -883,10 +883,13 @@ class DailyPlanOptimizerProgressive:
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         print(f"  Reference date (today): {today.strftime('%Y-%m-%d')}")
         
-        # SQUARED LATENESS: Every additional day late increases priority exponentially
-        # 10 days late = 100, 20 days = 400, 37 days = 1369
-        # This highlights very late orders as urgent priorities
-        print(f"  Using SQUARED lateness (lateness² × qty_weight)")
+        # LATENESS^4: Every additional day late increases priority dramatically
+        # 10 days late = 10,000
+        # 20 days late = 160,000
+        # 37 days late = 1,874,161
+        # This heavily prioritizes very late orders
+        LATENESS_POWER = 4
+        print(f"  Using lateness^{LATENESS_POWER} (lateness^{LATENESS_POWER} × qty_weight)")
         
         # Calculate weighted priority score for each day (only from LATE orders)
         for day in days:
@@ -916,11 +919,10 @@ class DailyPlanOptimizerProgressive:
                         # Calculate qty weight (order qty as % of day total)
                         qty_weight = order_qty / day_total_qty if day_total_qty > 0 else 0
                         
-                        # SQUARED LATENESS: lateness² × qty_weight
-                        # This makes each additional day late exponentially worse
-                        # 10 days = 100, 20 days = 400, 37 days = 1369
-                        lateness_squared = lateness_days * lateness_days
-                        weighted_priority += lateness_squared * qty_weight
+                        # LATENESS^N: lateness^N × qty_weight
+                        # This makes each additional day late dramatically worse
+                        lateness_powered = lateness_days ** LATENESS_POWER
+                        weighted_priority += lateness_powered * qty_weight
             
             day['weighted_priority'] = weighted_priority
             day['max_lateness_days'] = max_lateness
@@ -930,10 +932,10 @@ class DailyPlanOptimizerProgressive:
         # Print before sorting
         print("  Before sorting:")
         for day in days:
-            max_late_sq = day['max_lateness_days'] ** 2 if day['max_lateness_days'] > 0 else 0
+            max_late_pow = day['max_lateness_days'] ** LATENESS_POWER if day['max_lateness_days'] > 0 else 0
             print(f"    Day {day['day']}: priority={day['weighted_priority']:.1f}, "
                   f"late_orders={day['late_order_count']} ({day['late_order_qty_pct']:.1f}% of qty), "
-                  f"max_late={day['max_lateness_days']}d (²={max_late_sq})")
+                  f"max_late={day['max_lateness_days']}d (^{LATENESS_POWER}={max_late_pow:,})")
         
         # Sort days by weighted priority (higher priority first = descending)
         days.sort(key=lambda d: d['weighted_priority'], reverse=True)
