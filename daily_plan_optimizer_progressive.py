@@ -226,6 +226,61 @@ class DailyPlanOptimizerProgressive:
         else:
             return 'Other'
     
+    def _calculate_difficulty_score(self, order: Dict) -> float:
+        """
+        Calculate a normalized difficulty score for an order.
+        
+        Higher score = MORE DIFFICULT (slower, more complex)
+        Lower score = EASIER (faster, simpler)
+        
+        Based on:
+        - Qty/Hr: Higher is easier (more productive) -> inverted for score
+        - Picks/Qty: Higher is harder (more complex) -> direct for score
+        
+        Returns a score normalized roughly around 0 (easy negative, hard positive)
+        """
+        qty_hr = order.get('Qty/Hr', 0)
+        picks_qty = order.get('Picks/Qty', 0)
+        
+        # Normalize Qty/Hr (typical range 5-50, higher = easier)
+        # Invert so higher difficulty score = harder
+        if qty_hr > 0:
+            qty_hr_score = 1.0 / qty_hr * 20  # Scale factor
+        else:
+            qty_hr_score = 2.0  # Default to hard if no data
+        
+        # Picks/Qty (typical range 0.1-1.0, higher = harder)
+        picks_qty_score = picks_qty * 2  # Scale factor
+        
+        # Combined score (higher = harder)
+        difficulty = qty_hr_score + picks_qty_score
+        
+        return difficulty
+    
+    def _classify_difficulty(self, score: float, thresholds: Dict) -> str:
+        """Classify difficulty score into Easy/Medium/Hard."""
+        if score <= thresholds['easy']:
+            return 'Easy'
+        elif score >= thresholds['hard']:
+            return 'Hard'
+        else:
+            return 'Medium'
+    
+    def _calculate_difficulty_thresholds(self, orders_with_metrics: List[Dict]) -> Dict:
+        """Calculate difficulty thresholds based on the distribution of orders."""
+        scores = [item['difficulty_score'] for item in orders_with_metrics]
+        scores.sort()
+        
+        n = len(scores)
+        if n < 3:
+            return {'easy': 0.5, 'hard': 1.5}
+        
+        # Use percentiles: bottom 33% = Easy, top 33% = Hard
+        easy_threshold = scores[int(n * 0.33)]
+        hard_threshold = scores[int(n * 0.67)]
+        
+        return {'easy': easy_threshold, 'hard': hard_threshold}
+    
     def generate_multi_day_plans(self, num_days: int, brand: str = None) -> List[Dict]:
         """
         Generate multi-day plans with balanced hours AND order counts.
@@ -260,7 +315,7 @@ class DailyPlanOptimizerProgressive:
         qty_limit = limits['Qty']
         offline_limit = limits.get('Offline Jobs', float('inf'))
         
-        # Prepare orders with metrics
+        # Prepare orders with metrics including difficulty scores
         orders_with_metrics = []
         for order in brand_orders:
             qty = order.get('Lot Size', 0) or 0
@@ -268,14 +323,21 @@ class DailyPlanOptimizerProgressive:
             hours = order.get('Hours', 0) or 0
             
             if qty > 0 and hours > 0:
+                difficulty_score = self._calculate_difficulty_score(order)
                 orders_with_metrics.append({
                     'order': order,
                     'qty': qty,
                     'picks': picks,
                     'hours': hours,
                     'start_date': order.get('Start Date') or datetime.max,
-                    'line': self._get_line_category(order.get('Suggested Line', ''))
+                    'line': self._get_line_category(order.get('Suggested Line', '')),
+                    'difficulty_score': difficulty_score,
                 })
+        
+        # Calculate difficulty thresholds and classify orders
+        difficulty_thresholds = self._calculate_difficulty_thresholds(orders_with_metrics)
+        for item in orders_with_metrics:
+            item['difficulty'] = self._classify_difficulty(item['difficulty_score'], difficulty_thresholds)
         
         # Calculate totals
         total_hours = sum(item['hours'] for item in orders_with_metrics)
@@ -322,6 +384,16 @@ class DailyPlanOptimizerProgressive:
         print(f"  C3/4: {line_counts_source['C3/4']} ({line_ratios['C3/4']*100:.1f}%)")
         print(f"  Other: {line_counts_source['Other']}")
         
+        # Print difficulty distribution
+        easy_count = sum(1 for item in orders_with_metrics if item['difficulty'] == 'Easy')
+        medium_count = sum(1 for item in orders_with_metrics if item['difficulty'] == 'Medium')
+        hard_count = sum(1 for item in orders_with_metrics if item['difficulty'] == 'Hard')
+        print(f"\nSource difficulty distribution:")
+        print(f"  Easy: {easy_count} ({easy_count/total_orders*100:.1f}%)")
+        print(f"  Medium: {medium_count} ({medium_count/total_orders*100:.1f}%)")
+        print(f"  Hard: {hard_count} ({hard_count/total_orders*100:.1f}%)")
+        print(f"  Thresholds: Easy<={difficulty_thresholds['easy']:.3f}, Hard>={difficulty_thresholds['hard']:.3f}")
+        
         # Sort by start date (earlier first), then by hours (larger first for better packing)
         orders_with_metrics.sort(key=lambda x: (x['start_date'], -x['hours']))
         
@@ -342,6 +414,8 @@ class DailyPlanOptimizerProgressive:
                 'line_counts': {'C1': 0, 'C2': 0, 'C3/4': 0, 'Other': 0},
                 'line_hours': {'C1': 0, 'C2': 0, 'C3/4': 0, 'Other': 0},
                 'offline_count': 0,
+                'difficulty_sum': 0.0,  # Sum of difficulty scores for averaging
+                'difficulty_counts': {'Easy': 0, 'Medium': 0, 'Hard': 0},
             })
         
         # Round-robin distribution (like dealing cards)
@@ -359,80 +433,54 @@ class DailyPlanOptimizerProgressive:
         # ============================================
         print(f"\n--- Phase 2: Hours Balancing via Swaps ---")
         
-        # Perform multiple rounds of swap-based balancing
-        max_swap_rounds = 50
+        # Strategy: Try to get days 1 through N-1 as close to 100% as possible
+        # Day N (last day) is the "remainder" day
+        # We allow order count variance of up to 20% to achieve better hours balance
+        
+        max_order_variance = int(target_orders_per_day * 0.25)  # Allow 25% variance in order count
+        
+        # First, try to balance hours across ALL days (excluding moving to/from last day excessively)
+        max_swap_rounds = 100
         for swap_round in range(max_swap_rounds):
-            improved = False
+            # Sort days by hours (excluding last day for now)
+            day_hours = [(i, d['totals']['Hours'], d['num_orders']) for i, d in enumerate(days)]
+            day_hours.sort(key=lambda x: x[1])
             
-            # Calculate current hours for each day
-            day_hours = [d['totals']['Hours'] for d in days]
+            most_under_idx = day_hours[0][0]
+            most_over_idx = day_hours[-1][0]
             
-            # Find days that are over and under the target
-            # For "full" days, target is hours_limit; for last day, it's the remainder
-            targets = []
-            for i, d in enumerate(days):
-                if i < num_days - 1 or remainder_hours < 1:
-                    # Full days target 100%
-                    targets.append(hours_limit)
-                else:
-                    # Last day gets remainder (if significant)
-                    targets.append(remainder_hours if remainder_hours >= hours_limit * 0.3 else hours_limit)
+            hours_spread = day_hours[-1][1] - day_hours[0][1]
             
-            # Actually, for leveling, we want ALL days (except maybe last) at ~100%
-            # Let's find the biggest imbalances and try to fix them
-            
-            # Sort days by hours deviation from target
-            deviations = []
-            for i, d in enumerate(days):
-                target = hours_limit  # Target 100% for all days
-                deviation = d['totals']['Hours'] - target
-                deviations.append((i, deviation, d['totals']['Hours']))
-            
-            # Find most over and most under days
-            deviations.sort(key=lambda x: x[1])  # Sort by deviation (most under first)
-            
-            most_under_idx = deviations[0][0]
-            most_over_idx = deviations[-1][0]
-            
-            # If the difference is small, we're balanced enough
-            hours_spread = deviations[-1][2] - deviations[0][2]
-            if hours_spread < hours_limit * 0.05:  # Within 5% spread is good
-                print(f"  Round {swap_round + 1}: Hours spread {hours_spread:.1f} is acceptable, stopping")
+            # Stop if spread is acceptable
+            if hours_spread < hours_limit * 0.08:  # Within 8% spread
+                print(f"  Round {swap_round + 1}: Hours spread {hours_spread:.1f} is acceptable")
                 break
             
-            # Try to find a good swap
             day_under = days[most_under_idx]
             day_over = days[most_over_idx]
             
+            # Try swapping to improve hours balance
             best_swap = None
-            best_improvement = 0
+            best_score = -float('inf')
             
-            # Try swapping each order from over day with each order from under day
             for item_over in day_over['items']:
                 for item_under in day_under['items']:
-                    hours_diff = item_over['hours'] - item_under['hours']
-                    
-                    # This swap would move hours_diff from over to under
-                    # New deviation for over day: (day_over hours - hours_diff) - target
-                    # New deviation for under day: (day_under hours + hours_diff) - target
-                    
                     new_over_hours = day_over['totals']['Hours'] - item_over['hours'] + item_under['hours']
                     new_under_hours = day_under['totals']['Hours'] - item_under['hours'] + item_over['hours']
                     
-                    # Calculate improvement
+                    # Calculate improvement in hours deviation
                     old_over_dev = abs(day_over['totals']['Hours'] - hours_limit)
                     old_under_dev = abs(day_under['totals']['Hours'] - hours_limit)
                     new_over_dev = abs(new_over_hours - hours_limit)
                     new_under_dev = abs(new_under_hours - hours_limit)
                     
-                    improvement = (old_over_dev + old_under_dev) - (new_over_dev + new_under_dev)
+                    hours_improvement = (old_over_dev + old_under_dev) - (new_over_dev + new_under_dev)
                     
-                    if improvement > best_improvement:
-                        # Also check offline limits
+                    if hours_improvement > 0:
+                        # Check offline limits
                         over_line = item_over['order'].get('Suggested Line', '').strip().upper()
                         under_line = item_under['order'].get('Suggested Line', '').strip().upper()
                         
-                        # Check if swap would violate offline limits
                         new_over_offline = day_over['offline_count']
                         new_under_offline = day_under['offline_count']
                         if over_line == 'OFFLINE':
@@ -443,13 +491,13 @@ class DailyPlanOptimizerProgressive:
                             new_over_offline += 1
                         
                         if new_over_offline <= offline_limit and new_under_offline <= offline_limit:
-                            best_improvement = improvement
-                            best_swap = (item_over, item_under)
+                            if hours_improvement > best_score:
+                                best_score = hours_improvement
+                                best_swap = (item_over, item_under)
             
-            if best_swap and best_improvement > 0.5:  # Minimum improvement threshold
+            if best_swap and best_score > 0.1:
                 item_over, item_under = best_swap
                 
-                # Perform the swap
                 self._remove_order_from_day(day_over, item_over)
                 day_over['items'].remove(item_over)
                 
@@ -461,50 +509,46 @@ class DailyPlanOptimizerProgressive:
                 
                 self._add_order_to_day(day_under, item_over)
                 day_under['items'].append(item_over)
-                
-                improved = True
-                if (swap_round + 1) % 10 == 0:
-                    print(f"  Round {swap_round + 1}: Swapped orders, improvement={best_improvement:.1f}")
             else:
-                # No good swaps found between most over/under
-                # Try moving a single order from over to under
+                # Try moving orders (allows order count to change slightly)
                 best_move = None
-                best_move_improvement = 0
+                best_move_score = -float('inf')
                 
-                for item_over in day_over['items']:
-                    new_over_hours = day_over['totals']['Hours'] - item_over['hours']
-                    new_under_hours = day_under['totals']['Hours'] + item_over['hours']
-                    
-                    # Would this improve balance?
-                    old_over_dev = abs(day_over['totals']['Hours'] - hours_limit)
-                    old_under_dev = abs(day_under['totals']['Hours'] - hours_limit)
-                    new_over_dev = abs(new_over_hours - hours_limit)
-                    new_under_dev = abs(new_under_hours - hours_limit)
-                    
-                    improvement = (old_over_dev + old_under_dev) - (new_over_dev + new_under_dev)
-                    
-                    if improvement > best_move_improvement:
-                        over_line = item_over['order'].get('Suggested Line', '').strip().upper()
-                        new_under_offline = day_under['offline_count'] + (1 if over_line == 'OFFLINE' else 0)
+                # Check if order counts allow a move
+                can_move = (day_over['num_orders'] > target_orders_per_day - max_order_variance and
+                           day_under['num_orders'] < target_orders_per_day + max_order_variance)
+                
+                if can_move:
+                    for item in day_over['items']:
+                        new_over_hours = day_over['totals']['Hours'] - item['hours']
+                        new_under_hours = day_under['totals']['Hours'] + item['hours']
                         
-                        if new_under_offline <= offline_limit:
-                            best_move_improvement = improvement
-                            best_move = item_over
+                        old_over_dev = abs(day_over['totals']['Hours'] - hours_limit)
+                        old_under_dev = abs(day_under['totals']['Hours'] - hours_limit)
+                        new_over_dev = abs(new_over_hours - hours_limit)
+                        new_under_dev = abs(new_under_hours - hours_limit)
+                        
+                        improvement = (old_over_dev + old_under_dev) - (new_over_dev + new_under_dev)
+                        
+                        if improvement > best_move_score:
+                            item_line = item['order'].get('Suggested Line', '').strip().upper()
+                            new_under_offline = day_under['offline_count'] + (1 if item_line == 'OFFLINE' else 0)
+                            
+                            if new_under_offline <= offline_limit:
+                                best_move_score = improvement
+                                best_move = item
+                    
+                    if best_move and best_move_score > 0.5:
+                        self._remove_order_from_day(day_over, best_move)
+                        day_over['items'].remove(best_move)
+                        
+                        self._add_order_to_day(day_under, best_move)
+                        day_under['items'].append(best_move)
+                        continue
                 
-                if best_move and best_move_improvement > 0.5:
-                    # Move the order
-                    self._remove_order_from_day(day_over, best_move)
-                    day_over['items'].remove(best_move)
-                    
-                    self._add_order_to_day(day_under, best_move)
-                    day_under['items'].append(best_move)
-                    
-                    improved = True
-                    if (swap_round + 1) % 10 == 0:
-                        print(f"  Round {swap_round + 1}: Moved order, improvement={best_move_improvement:.1f}")
-            
-            if not improved:
-                print(f"  Round {swap_round + 1}: No improvement found, stopping")
+                # No improvement possible
+                if swap_round == 0:
+                    print(f"  No beneficial swaps found in initial pass")
                 break
         
         print("\nAfter hours balancing:")
@@ -641,7 +685,136 @@ class DailyPlanOptimizerProgressive:
             print(f"  Day {day['day']}: {day['num_orders']} orders, {day['totals']['Hours']:.1f} hours")
         
         # ============================================
-        # PHASE 4: Final Cleanup
+        # PHASE 4: Difficulty Balancing
+        # ============================================
+        # Goal: Each day should have similar AVERAGE difficulty
+        # Swap Hard orders for Easy orders between days to balance
+        print(f"\n--- Phase 4: Difficulty Balancing ---")
+        
+        # Calculate average difficulty across all orders
+        total_difficulty = sum(d['difficulty_sum'] for d in days)
+        target_avg_difficulty = total_difficulty / total_orders if total_orders > 0 else 1.0
+        
+        print(f"  Target avg difficulty per order: {target_avg_difficulty:.3f}")
+        
+        max_difficulty_rounds = 30
+        for diff_round in range(max_difficulty_rounds):
+            # Calculate average difficulty for each day
+            day_avg_difficulties = []
+            for d in days:
+                if d['num_orders'] > 0:
+                    avg = d['difficulty_sum'] / d['num_orders']
+                else:
+                    avg = target_avg_difficulty
+                day_avg_difficulties.append(avg)
+            
+            # Find most and least difficult days
+            min_diff_idx = day_avg_difficulties.index(min(day_avg_difficulties))
+            max_diff_idx = day_avg_difficulties.index(max(day_avg_difficulties))
+            
+            difficulty_spread = max(day_avg_difficulties) - min(day_avg_difficulties)
+            
+            if difficulty_spread < target_avg_difficulty * 0.15:  # Within 15% spread is acceptable
+                print(f"  Round {diff_round + 1}: Difficulty spread {difficulty_spread:.3f} is acceptable, stopping")
+                break
+            
+            # The day with highest avg difficulty needs easier orders
+            # The day with lowest avg difficulty can take harder orders
+            hard_day = days[max_diff_idx]
+            easy_day = days[min_diff_idx]
+            
+            # Find best swap: move a hard order from hard_day to easy_day
+            # and move an easy order from easy_day to hard_day
+            best_swap = None
+            best_improvement = 0
+            
+            for item_hard in hard_day['items']:
+                if item_hard.get('difficulty') != 'Hard':
+                    continue  # Only consider moving hard orders out
+                    
+                for item_easy in easy_day['items']:
+                    if item_easy.get('difficulty') != 'Easy':
+                        continue  # Only swap with easy orders
+                    
+                    # Calculate what this swap would do to hours
+                    new_hard_day_hours = hard_day['totals']['Hours'] - item_hard['hours'] + item_easy['hours']
+                    new_easy_day_hours = easy_day['totals']['Hours'] - item_easy['hours'] + item_hard['hours']
+                    
+                    # Check if hours would be too far from target
+                    old_hard_dev = abs(hard_day['totals']['Hours'] - hours_limit)
+                    old_easy_dev = abs(easy_day['totals']['Hours'] - hours_limit)
+                    new_hard_dev = abs(new_hard_day_hours - hours_limit)
+                    new_easy_dev = abs(new_easy_day_hours - hours_limit)
+                    
+                    hours_penalty = (new_hard_dev + new_easy_dev) - (old_hard_dev + old_easy_dev)
+                    
+                    # Don't accept swaps that hurt hours too much
+                    if hours_penalty > hours_limit * 0.05:
+                        continue
+                    
+                    # Calculate difficulty improvement
+                    diff_change = item_hard['difficulty_score'] - item_easy['difficulty_score']
+                    
+                    # After swap:
+                    # hard_day loses item_hard, gains item_easy -> lower avg (good)
+                    # easy_day loses item_easy, gains item_hard -> higher avg (acceptable)
+                    
+                    # Score the improvement
+                    improvement = diff_change - hours_penalty * 0.1
+                    
+                    if improvement > best_improvement:
+                        # Check offline limits
+                        hard_line = item_hard['order'].get('Suggested Line', '').strip().upper()
+                        easy_line = item_easy['order'].get('Suggested Line', '').strip().upper()
+                        
+                        new_hard_offline = hard_day['offline_count']
+                        new_easy_offline = easy_day['offline_count']
+                        if hard_line == 'OFFLINE':
+                            new_hard_offline -= 1
+                            new_easy_offline += 1
+                        if easy_line == 'OFFLINE':
+                            new_easy_offline -= 1
+                            new_hard_offline += 1
+                        
+                        if new_hard_offline <= offline_limit and new_easy_offline <= offline_limit:
+                            best_improvement = improvement
+                            best_swap = (item_hard, item_easy)
+            
+            if best_swap and best_improvement > 0.05:
+                item_hard, item_easy = best_swap
+                
+                # Perform the swap
+                self._remove_order_from_day(hard_day, item_hard)
+                hard_day['items'].remove(item_hard)
+                
+                self._remove_order_from_day(easy_day, item_easy)
+                easy_day['items'].remove(item_easy)
+                
+                self._add_order_to_day(hard_day, item_easy)
+                hard_day['items'].append(item_easy)
+                
+                self._add_order_to_day(easy_day, item_hard)
+                easy_day['items'].append(item_hard)
+                
+                if (diff_round + 1) % 10 == 0:
+                    print(f"  Round {diff_round + 1}: Swapped Hard<->Easy, improvement={best_improvement:.3f}")
+            else:
+                # No good swap found
+                if diff_round == 0:
+                    print(f"  No beneficial difficulty swaps found")
+                break
+        
+        # Print difficulty status
+        print("\nAfter difficulty balancing:")
+        for day in days:
+            if day['num_orders'] > 0:
+                avg_diff = day['difficulty_sum'] / day['num_orders']
+                counts = day['difficulty_counts']
+                print(f"  Day {day['day']}: avg_diff={avg_diff:.3f}, "
+                      f"Easy={counts['Easy']}, Med={counts['Medium']}, Hard={counts['Hard']}")
+        
+        # ============================================
+        # PHASE 5: Final Cleanup
         # ============================================
         
         # Remove items list (no longer needed) and finalize
@@ -663,6 +836,12 @@ class DailyPlanOptimizerProgressive:
                 'C3/4': {'count': day['line_counts']['C3/4'], 'hours': day['line_hours']['C3/4']},
                 'Other': {'count': day['line_counts']['Other'], 'hours': day['line_hours']['Other']}
             }
+            
+            # Add difficulty info
+            if day['num_orders'] > 0:
+                day['avg_difficulty'] = day['difficulty_sum'] / day['num_orders']
+            else:
+                day['avg_difficulty'] = 0
         
         # Print final summary
         print(f"\n{'='*60}")
@@ -670,7 +849,8 @@ class DailyPlanOptimizerProgressive:
         print(f"{'='*60}")
         for day in days:
             print(f"  Day {day['day']}: {day['num_orders']} orders, "
-                  f"{day['totals']['Hours']:.1f} hours ({day['utilization']['Hours']:.1f}%)")
+                  f"{day['totals']['Hours']:.1f} hours ({day['utilization']['Hours']:.1f}%), "
+                  f"avg_diff={day.get('avg_difficulty', 0):.3f}")
         
         return days
     
@@ -691,6 +871,12 @@ class DailyPlanOptimizerProgressive:
         order_line_raw = order.get('Suggested Line', '').strip()
         if order_line_raw.upper() == 'OFFLINE':
             day['offline_count'] -= 1
+        
+        # Track difficulty
+        if 'difficulty_sum' in day:
+            day['difficulty_sum'] -= item.get('difficulty_score', 0)
+        if 'difficulty_counts' in day and 'difficulty' in item:
+            day['difficulty_counts'][item['difficulty']] -= 1
     
     def _fill_day_progressive(self, day_num: int, available_orders: List[Dict], 
                               target_hours: float, hours_limit: float,
@@ -890,6 +1076,12 @@ class DailyPlanOptimizerProgressive:
         order_line_raw = order.get('Suggested Line', '').strip()
         if order_line_raw.upper() == 'OFFLINE':
             day['offline_count'] += 1
+        
+        # Track difficulty
+        if 'difficulty_sum' in day:
+            day['difficulty_sum'] += item.get('difficulty_score', 0)
+        if 'difficulty_counts' in day and 'difficulty' in item:
+            day['difficulty_counts'][item['difficulty']] += 1
     
     def _create_remainder(self, remaining_orders: List[Dict], hours_limit: float,
                          qty_limit: float, picks_limit: float, 
