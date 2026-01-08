@@ -1,7 +1,8 @@
 """
-Daily Planning Optimizer - Progressive Fill
+Daily Planning Optimizer - Progressive Fill (Average Date Sort)
 Fills each day to 100% hours before moving to the next day.
 Balances lines proportionally within each day.
+Final sort by AVERAGE order date (not earliest) - more robust to outliers.
 """
 import csv
 import openpyxl
@@ -868,30 +869,47 @@ class DailyPlanOptimizerProgressive:
                 day['avg_difficulty'] = 0
         
         # ============================================
-        # PHASE 6: Sort Days by Earliest Order Date
+        # PHASE 6: Sort Days by Average Order Date
         # ============================================
-        # Renumber days so that the day with the earliest order date comes first
-        print(f"\n--- Phase 6: Sort Days by Earliest Order Date ---")
+        # Renumber days so that the day with the earliest AVERAGE order date comes first
+        # This is better than earliest date because it's not skewed by outliers
+        print(f"\n--- Phase 6: Sort Days by Average Order Date ---")
         
-        # Calculate earliest order date for each day
+        # Calculate average order date for each day
+        reference_date = datetime(2020, 1, 1)  # Reference point for date arithmetic
+        
         for day in days:
-            earliest_date = None
+            valid_dates = []
             for order in day['orders']:
                 order_date = order.get('Start Date')
                 if order_date and order_date != datetime.max:
-                    if earliest_date is None or order_date < earliest_date:
-                        earliest_date = order_date
-            day['earliest_order_date'] = earliest_date or datetime.max
+                    valid_dates.append(order_date)
+            
+            if valid_dates:
+                # Calculate average as days from reference, then convert back
+                avg_days = sum((d - reference_date).days for d in valid_dates) / len(valid_dates)
+                from datetime import timedelta
+                day['avg_order_date'] = reference_date + timedelta(days=avg_days)
+                day['earliest_order_date'] = min(valid_dates)
+                day['latest_order_date'] = max(valid_dates)
+            else:
+                day['avg_order_date'] = datetime.max
+                day['earliest_order_date'] = datetime.max
+                day['latest_order_date'] = datetime.max
         
         # Print before sorting
         print("  Before sorting:")
         for day in days:
+            avg = day['avg_order_date']
             earliest = day['earliest_order_date']
-            date_str = earliest.strftime('%Y-%m-%d') if earliest != datetime.max else 'N/A'
-            print(f"    Day {day['day']}: earliest order = {date_str}")
+            latest = day['latest_order_date']
+            avg_str = avg.strftime('%Y-%m-%d') if avg != datetime.max else 'N/A'
+            earliest_str = earliest.strftime('%Y-%m-%d') if earliest != datetime.max else 'N/A'
+            latest_str = latest.strftime('%Y-%m-%d') if latest != datetime.max else 'N/A'
+            print(f"    Day {day['day']}: avg={avg_str} (range: {earliest_str} to {latest_str})")
         
-        # Sort days by earliest order date
-        days.sort(key=lambda d: d['earliest_order_date'])
+        # Sort days by average order date
+        days.sort(key=lambda d: d['avg_order_date'])
         
         # Renumber the days
         for i, day in enumerate(days, 1):
@@ -901,14 +919,15 @@ class DailyPlanOptimizerProgressive:
         # Print after sorting
         print("  After sorting:")
         for day in days:
-            earliest = day['earliest_order_date']
-            date_str = earliest.strftime('%Y-%m-%d') if earliest != datetime.max else 'N/A'
-            print(f"    Day {day['day']}: earliest order = {date_str}")
+            avg = day['avg_order_date']
+            avg_str = avg.strftime('%Y-%m-%d') if avg != datetime.max else 'N/A'
+            print(f"    Day {day['day']}: avg order date = {avg_str}")
         
-        # Clean up the temporary field
+        # Clean up the temporary fields
         for day in days:
-            if 'earliest_order_date' in day:
-                del day['earliest_order_date']
+            for field in ['avg_order_date', 'earliest_order_date', 'latest_order_date']:
+                if field in day:
+                    del day[field]
         
         # Print final summary
         print(f"\n{'='*60}")
@@ -1373,7 +1392,7 @@ def main():
                 
                 # Export
                 brand_lower = brand.lower()
-                excel_filename = f'{timestamp}-{brand_lower}-progressive-plan.xlsx'
+                excel_filename = f'{timestamp}-{brand_lower}-progressive-avgdate-plan.xlsx'
                 excel_path = os.path.join(output_dir, excel_filename)
                 
                 optimizer.export_to_excel(day_plans, excel_path)
