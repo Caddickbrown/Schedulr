@@ -125,22 +125,29 @@
    - Prioritizes by due date
    - Targets ~40 orders
 
-2. **Multi-Day Planning**
-   - **Automatic**: Always runs in multi-day mode, determines maximum possible days automatically
-   - **Sequential filling**: Fills each day to 100% hours before moving to the next
-   - Each day must reach at least 99.5% of hours target to be considered complete
-   - Algorithm continues until no more complete days can be created
-   - Stops creating new days when can't fill a day to at least 99.5% of hours target
-   - Puts all remaining orders in "Remainder"
+2. **Multi-Day Planning (Round-Robin with Balancing)**
+   - **Phase 1: Round-Robin Distribution**
+     - Orders are sorted by start date (earlier first)
+     - Distributed across days like dealing cards (order 1→Day1, order 2→Day2, etc.)
+     - This ensures approximately equal order counts per day
+   - **Phase 2: Hours Balancing**
+     - Swaps orders between days to balance hours utilization
+     - Moves orders from over-utilized days to under-utilized days
+     - Performs order-for-order swaps when simple moves don't improve balance
+   - **Result**: ALL orders scheduled, NO remainder, balanced hours AND order counts
+   - Days are labeled "Day 1", "Day 2", etc.
 
-3. **Line Balancing**
-   - Ensures at least one order from C1, C2, C3/4 early in each day
-   - Scores orders based on how they improve balance
-   - Strong preference for underrepresented lines
+3. **Balance Targets**
+   - **Hours**: Each day targets equal share of total hours (max hours limit per day)
+   - **Order counts**: Each day gets roughly equal number of orders
+   - **Picks/Qty**: Naturally balanced by order count balancing
 
-4. **Offline Jobs**
+4. **Line Distribution**
+   - Line distribution tracked per day
+   - Balanced across days by the round-robin distribution
+
+5. **Offline Jobs**
    - Tracks count of offline orders per day
-   - Blocks selection if limit would be exceeded
    - Limit applies per day (not cumulative across days)
 
 ## Output Format
