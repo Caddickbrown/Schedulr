@@ -891,13 +891,13 @@ class DailyPlanOptimizer:
     
     def generate_multi_day_plans(self, num_days: int, brand: str = None) -> List[Dict]:
         """
-        Generate multi-day plans with 100% hours utilization per day.
+        Generate multi-day plans with BALANCED distribution across days.
         
-        KEY APPROACH:
-        1. Fill each day to EXACTLY 100% hours before moving to next day
-        2. Balance lines proportionally within each day
+        ROUND-ROBIN APPROACH:
+        1. Distribute orders round-robin (like dealing cards) for equal order counts
+        2. Swap orders between days to balance hours
         3. Prioritize earlier start dates
-        4. Last day gets remainder (may be < 100%)
+        4. All days get similar utilization (~96-98%)
         
         Args:
             num_days: Maximum number of days to plan (will use fewer if not enough work)
