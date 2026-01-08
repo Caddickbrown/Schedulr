@@ -870,58 +870,61 @@ class DailyPlanOptimizerProgressive:
                 day['avg_difficulty'] = 0
         
         # ============================================
-        # PHASE 6: Sort Days by Weighted Priority Score
+        # PHASE 6: Sort Days by Weighted Late Order Priority
         # ============================================
-        # Priority = sum of (lateness × qty_weight) for each order
-        # - Lateness: days since start date (more overdue = higher priority)
-        # - Qty weight: order qty as % of day's total qty (bigger orders matter more)
+        # Only LATE orders (past start date) contribute to priority
+        # Priority = sum of (days_late × qty_weight) for late orders only
+        # - Days late: how many days past start date
+        # - Qty weight: order qty as % of day's total qty (bigger late orders matter more)
         # Higher priority score = should be done first
-        print(f"\n--- Phase 6: Sort Days by Weighted Priority Score ---")
+        print(f"\n--- Phase 6: Sort Days by Weighted Late Order Priority ---")
         
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         print(f"  Reference date (today): {today.strftime('%Y-%m-%d')}")
         
-        # Calculate weighted priority score for each day
+        # Calculate weighted priority score for each day (only from LATE orders)
         for day in days:
             day_total_qty = day['totals']['Qty']
             weighted_priority = 0.0
             max_lateness = 0
-            earliest_date = None
+            late_order_count = 0
+            late_order_qty = 0
             
             for order in day['orders']:
                 order_date = order.get('Start Date')
                 order_qty = order.get('Lot Size', 0) or 0
                 
                 if order_date and order_date != datetime.max:
-                    # Calculate lateness (days overdue, positive = overdue)
+                    # Calculate lateness (days overdue)
                     lateness_days = (today - order_date).days
                     
-                    # Track max lateness for display
-                    if lateness_days > max_lateness:
-                        max_lateness = lateness_days
-                    
-                    # Track earliest date
-                    if earliest_date is None or order_date < earliest_date:
-                        earliest_date = order_date
-                    
-                    # Calculate qty weight (order qty as % of day total)
-                    qty_weight = order_qty / day_total_qty if day_total_qty > 0 else 0
-                    
-                    # Weighted contribution: lateness × qty_weight
-                    # Orders that are more overdue AND bigger contribute more
-                    weighted_priority += lateness_days * qty_weight
+                    # Only consider LATE orders (start date has passed)
+                    if lateness_days > 0:
+                        late_order_count += 1
+                        late_order_qty += order_qty
+                        
+                        # Track max lateness for display
+                        if lateness_days > max_lateness:
+                            max_lateness = lateness_days
+                        
+                        # Calculate qty weight (order qty as % of day total)
+                        qty_weight = order_qty / day_total_qty if day_total_qty > 0 else 0
+                        
+                        # Weighted contribution: days_late × qty_weight
+                        # Orders that are more overdue AND bigger contribute more
+                        weighted_priority += lateness_days * qty_weight
             
             day['weighted_priority'] = weighted_priority
             day['max_lateness_days'] = max_lateness
-            day['earliest_order_date'] = earliest_date or datetime.max
+            day['late_order_count'] = late_order_count
+            day['late_order_qty_pct'] = (late_order_qty / day_total_qty * 100) if day_total_qty > 0 else 0
         
         # Print before sorting
         print("  Before sorting:")
         for day in days:
-            earliest = day['earliest_order_date']
-            date_str = earliest.strftime('%Y-%m-%d') if earliest != datetime.max else 'N/A'
             print(f"    Day {day['day']}: priority={day['weighted_priority']:.1f}, "
-                  f"max_late={day['max_lateness_days']}d, earliest={date_str}")
+                  f"late_orders={day['late_order_count']} ({day['late_order_qty_pct']:.1f}% of qty), "
+                  f"max_late={day['max_lateness_days']}d")
         
         # Sort days by weighted priority (higher priority first = descending)
         days.sort(key=lambda d: d['weighted_priority'], reverse=True)
@@ -935,11 +938,11 @@ class DailyPlanOptimizerProgressive:
         print("  After sorting:")
         for day in days:
             print(f"    Day {day['day']}: priority={day['weighted_priority']:.1f}, "
-                  f"max_late={day['max_lateness_days']}d")
+                  f"late_orders={day['late_order_count']}, max_late={day['max_lateness_days']}d")
         
         # Clean up the temporary fields
         for day in days:
-            for field in ['weighted_priority', 'max_lateness_days', 'earliest_order_date']:
+            for field in ['weighted_priority', 'max_lateness_days', 'late_order_count', 'late_order_qty_pct']:
                 if field in day:
                     del day[field]
         
@@ -1406,7 +1409,7 @@ def main():
                 
                 # Export
                 brand_lower = brand.lower()
-                excel_filename = f'{timestamp}-{brand_lower}-progressive-plan.xlsx'
+                excel_filename = f'{timestamp}-{brand_lower}-progressive-weighted-plan.xlsx'
                 excel_path = os.path.join(output_dir, excel_filename)
                 
                 optimizer.export_to_excel(day_plans, excel_path)
