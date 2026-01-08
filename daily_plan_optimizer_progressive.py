@@ -150,6 +150,19 @@ class DailyPlanOptimizerProgressive:
                 else:
                     parsed_date = None
                 
+                # Load efficiency metrics for difficulty classification
+                qty_hr = self._parse_float(row_dict.get('Qty/Hr', 0))
+                picks_hr = self._parse_float(row_dict.get('Picks/Hr', 0))
+                picks_qty = self._parse_float(row_dict.get('Picks/Qty', 0))
+                
+                # Calculate if not present in data
+                if qty_hr == 0 and hours > 0:
+                    qty_hr = qty / hours
+                if picks_hr == 0 and hours > 0:
+                    picks_hr = picks / hours
+                if picks_qty == 0 and qty > 0:
+                    picks_qty = picks / qty
+                
                 order = {
                     'Order No': str(row_dict.get('Order No', '')).strip(),
                     'Part No': str(row_dict.get('Part No', '')).strip(),
@@ -162,6 +175,9 @@ class DailyPlanOptimizerProgressive:
                     'Wrap Type': str(row_dict.get('Wrap Type', '')).strip(),
                     'CPU': self._parse_float(row_dict.get('CPU', 0)),
                     'Suggested Line': suggested_line,
+                    'Qty/Hr': qty_hr,
+                    'Picks/Hr': picks_hr,
+                    'Picks/Qty': picks_qty,
                 }
                 
                 if order['Order No'] and order['Part No'] and order['Lot Size'] > 0:
@@ -210,15 +226,70 @@ class DailyPlanOptimizerProgressive:
         else:
             return 'Other'
     
+    def _calculate_difficulty_score(self, order: Dict) -> float:
+        """
+        Calculate a normalized difficulty score for an order.
+        
+        Higher score = MORE DIFFICULT (slower, more complex)
+        Lower score = EASIER (faster, simpler)
+        
+        Based on:
+        - Qty/Hr: Higher is easier (more productive) -> inverted for score
+        - Picks/Qty: Higher is harder (more complex) -> direct for score
+        
+        Returns a score normalized roughly around 0 (easy negative, hard positive)
+        """
+        qty_hr = order.get('Qty/Hr', 0)
+        picks_qty = order.get('Picks/Qty', 0)
+        
+        # Normalize Qty/Hr (typical range 5-50, higher = easier)
+        # Invert so higher difficulty score = harder
+        if qty_hr > 0:
+            qty_hr_score = 1.0 / qty_hr * 20  # Scale factor
+        else:
+            qty_hr_score = 2.0  # Default to hard if no data
+        
+        # Picks/Qty (typical range 0.1-1.0, higher = harder)
+        picks_qty_score = picks_qty * 2  # Scale factor
+        
+        # Combined score (higher = harder)
+        difficulty = qty_hr_score + picks_qty_score
+        
+        return difficulty
+    
+    def _classify_difficulty(self, score: float, thresholds: Dict) -> str:
+        """Classify difficulty score into Easy/Medium/Hard."""
+        if score <= thresholds['easy']:
+            return 'Easy'
+        elif score >= thresholds['hard']:
+            return 'Hard'
+        else:
+            return 'Medium'
+    
+    def _calculate_difficulty_thresholds(self, orders_with_metrics: List[Dict]) -> Dict:
+        """Calculate difficulty thresholds based on the distribution of orders."""
+        scores = [item['difficulty_score'] for item in orders_with_metrics]
+        scores.sort()
+        
+        n = len(scores)
+        if n < 3:
+            return {'easy': 0.5, 'hard': 1.5}
+        
+        # Use percentiles: bottom 33% = Easy, top 33% = Hard
+        easy_threshold = scores[int(n * 0.33)]
+        hard_threshold = scores[int(n * 0.67)]
+        
+        return {'easy': easy_threshold, 'hard': hard_threshold}
+    
     def generate_multi_day_plans(self, num_days: int, brand: str = None) -> List[Dict]:
         """
-        Generate multi-day plans with 100% hours utilization per day.
+        Generate multi-day plans with balanced hours AND order counts.
         
-        PROGRESSIVE FILL APPROACH:
-        1. Fill each day to EXACTLY 100% hours before moving to next day
-        2. Balance lines proportionally within each day
-        3. Prioritize earlier start dates
-        4. Last day gets remainder (may be < 100%)
+        MULTI-ROUND LEVELING APPROACH:
+        1. Round-robin distribute orders across days for even order counts
+        2. Perform swap-based rebalancing to level hours while keeping order counts similar
+        3. Multiple passes to ensure both metrics are balanced
+        4. Last day (remainder) is still allowed but should be reasonably balanced
         
         Args:
             num_days: Maximum number of days to plan
@@ -244,7 +315,7 @@ class DailyPlanOptimizerProgressive:
         qty_limit = limits['Qty']
         offline_limit = limits.get('Offline Jobs', float('inf'))
         
-        # Prepare orders with metrics
+        # Prepare orders with metrics including difficulty scores
         orders_with_metrics = []
         for order in brand_orders:
             qty = order.get('Lot Size', 0) or 0
@@ -252,14 +323,21 @@ class DailyPlanOptimizerProgressive:
             hours = order.get('Hours', 0) or 0
             
             if qty > 0 and hours > 0:
+                difficulty_score = self._calculate_difficulty_score(order)
                 orders_with_metrics.append({
                     'order': order,
                     'qty': qty,
                     'picks': picks,
                     'hours': hours,
                     'start_date': order.get('Start Date') or datetime.max,
-                    'line': self._get_line_category(order.get('Suggested Line', ''))
+                    'line': self._get_line_category(order.get('Suggested Line', '')),
+                    'difficulty_score': difficulty_score,
                 })
+        
+        # Calculate difficulty thresholds and classify orders
+        difficulty_thresholds = self._calculate_difficulty_thresholds(orders_with_metrics)
+        for item in orders_with_metrics:
+            item['difficulty'] = self._classify_difficulty(item['difficulty_score'], difficulty_thresholds)
         
         # Calculate totals
         total_hours = sum(item['hours'] for item in orders_with_metrics)
@@ -288,92 +366,541 @@ class DailyPlanOptimizerProgressive:
         actual_days = full_days_possible + (1 if remainder_hours > 0 else 0)
         num_days = min(num_days, actual_days)
         
+        # Calculate target orders per day
+        target_orders_per_day = total_orders / num_days if num_days > 0 else total_orders
+        
         print(f"\n{'='*60}")
-        print(f"PROGRESSIVE FILL PLANNING: {brand}")
+        print(f"MULTI-ROUND LEVELING PLANNING: {brand}")
         print(f"{'='*60}")
         print(f"Total orders: {total_orders}")
         print(f"Total hours: {total_hours:.1f}")
         print(f"Hours limit per day: {hours_limit}")
         print(f"Full days possible: {full_days_possible} at 100%")
         print(f"Remainder: {remainder_hours:.1f} hours ({remainder_hours/hours_limit*100:.1f}%)")
+        print(f"Target orders per day: {target_orders_per_day:.1f}")
         print(f"\nSource line distribution:")
         print(f"  C1: {line_counts_source['C1']} ({line_ratios['C1']*100:.1f}%)")
         print(f"  C2: {line_counts_source['C2']} ({line_ratios['C2']*100:.1f}%)")
         print(f"  C3/4: {line_counts_source['C3/4']} ({line_ratios['C3/4']*100:.1f}%)")
         print(f"  Other: {line_counts_source['Other']}")
         
+        # Print difficulty distribution
+        easy_count = sum(1 for item in orders_with_metrics if item['difficulty'] == 'Easy')
+        medium_count = sum(1 for item in orders_with_metrics if item['difficulty'] == 'Medium')
+        hard_count = sum(1 for item in orders_with_metrics if item['difficulty'] == 'Hard')
+        print(f"\nSource difficulty distribution:")
+        print(f"  Easy: {easy_count} ({easy_count/total_orders*100:.1f}%)")
+        print(f"  Medium: {medium_count} ({medium_count/total_orders*100:.1f}%)")
+        print(f"  Hard: {hard_count} ({hard_count/total_orders*100:.1f}%)")
+        print(f"  Thresholds: Easy<={difficulty_thresholds['easy']:.3f}, Hard>={difficulty_thresholds['hard']:.3f}")
+        
         # Sort by start date (earlier first), then by hours (larger first for better packing)
         orders_with_metrics.sort(key=lambda x: (x['start_date'], -x['hours']))
         
-        remaining_orders = orders_with_metrics.copy()
-        days = []
+        # ============================================
+        # PHASE 1: Proportional Distribution
+        # ============================================
+        print(f"\n--- Phase 1: Proportional Distribution ---")
         
-        # Fill each day to 100% before moving to next
+        # Calculate target orders per day
+        # Non-remainder days get full share, remainder day gets proportional share
+        # This leaves room for future orders to top up the remainder
+        
+        remainder_hours_ratio = remainder_hours / hours_limit if hours_limit > 0 else 1.0
+        
+        # Calculate orders for each day
+        # Days 1 to N-1: equal share of (total - remainder's proportional share)
+        # Day N (remainder): proportional to its hours ratio
+        
+        if num_days > 1 and remainder_hours > 0:
+            # Remainder day should have orders proportional to its hours
+            remainder_target_orders = int(target_orders_per_day * remainder_hours_ratio)
+            non_remainder_total_orders = total_orders - remainder_target_orders
+            orders_per_non_remainder = non_remainder_total_orders / (num_days - 1)
+            
+            print(f"  Remainder day will be at ~{remainder_hours_ratio*100:.1f}% hours")
+            print(f"  Giving remainder ~{remainder_target_orders} orders (proportional)")
+            print(f"  Other days get ~{orders_per_non_remainder:.1f} orders each")
+        else:
+            remainder_target_orders = int(target_orders_per_day)
+            orders_per_non_remainder = target_orders_per_day
+        
+        # Initialize days
+        days = []
         for day_num in range(1, num_days + 1):
-            if not remaining_orders:
+            is_remainder = (day_num == num_days)
+            days.append({
+                'day': day_num,
+                'orders': [],
+                'items': [],  # Store the item dicts for easier manipulation
+                'totals': {'Qty': 0, 'Picks': 0, 'Hours': 0},
+                'num_orders': 0,
+                'line_counts': {'C1': 0, 'C2': 0, 'C3/4': 0, 'Other': 0},
+                'line_hours': {'C1': 0, 'C2': 0, 'C3/4': 0, 'Other': 0},
+                'offline_count': 0,
+                'difficulty_sum': 0.0,  # Sum of difficulty scores for averaging
+                'difficulty_counts': {'Easy': 0, 'Medium': 0, 'Hard': 0},
+                'is_remainder': is_remainder,
+                'target_orders': remainder_target_orders if is_remainder else int(orders_per_non_remainder),
+            })
+        
+        # Distribute orders - round-robin but skip remainder more often
+        # This gives remainder proportionally fewer orders
+        order_idx = 0
+        day_idx = 0
+        remainder_day_idx = num_days - 1
+        
+        while order_idx < len(orders_with_metrics):
+            item = orders_with_metrics[order_idx]
+            current_day = days[day_idx]
+            
+            # Check if this day can accept more orders
+            if current_day['num_orders'] < current_day['target_orders']:
+                self._add_order_to_day(current_day, item)
+                current_day['items'].append(item)
+                order_idx += 1
+            
+            # Move to next day
+            day_idx = (day_idx + 1) % num_days
+            
+            # If we've gone through all days and none can accept, force add to least full
+            if order_idx < len(orders_with_metrics):
+                all_full = all(d['num_orders'] >= d['target_orders'] for d in days)
+                if all_full:
+                    # Find day with fewest orders relative to target
+                    min_ratio_day = min(days, key=lambda d: d['num_orders'] / d['target_orders'] if d['target_orders'] > 0 else float('inf'))
+                    item = orders_with_metrics[order_idx]
+                    self._add_order_to_day(min_ratio_day, item)
+                    min_ratio_day['items'].append(item)
+                    order_idx += 1
+        
+        print("\nAfter proportional distribution:")
+        for day in days:
+            tag = " (REMAINDER)" if day.get('is_remainder') else ""
+            print(f"  Day {day['day']}: {day['num_orders']} orders, {day['totals']['Hours']:.1f} hours{tag}")
+        
+        # ============================================
+        # PHASE 2: Balanced Hours Optimization
+        # ============================================
+        print(f"\n--- Phase 2: Hours Balancing ---")
+        
+        # Strategy:
+        # 1. Days 1 to N-1 should be as close to 100% as possible
+        # 2. Day N (last day) is the "remainder" - can have less hours
+        # 3. BUT remainder should stay BALANCED (picks, difficulty, lines)
+        # 4. Only do SWAPS (not moves) to preserve order count balance
+        
+        remainder_day_idx = num_days - 1
+        remainder_day = days[remainder_day_idx]
+        
+        print(f"  Remainder day: Day {remainder_day['day']}")
+        
+        # Calculate average metrics per order for balance checking
+        avg_picks_per_order = total_picks / total_orders if total_orders > 0 else 0
+        avg_hours_per_order = total_hours / total_orders if total_orders > 0 else 0
+        
+        # Phase 2a: Swap-based balancing to maximize hours on non-remainder days
+        # Key: when swapping with remainder, prefer swaps that keep remainder balanced
+        max_swap_rounds = 150
+        swaps_made = 0
+        
+        for swap_round in range(max_swap_rounds):
+            # Find non-remainder day most under 100%
+            non_rem_days_under = [(i, d) for i, d in enumerate(days[:-1]) 
+                                  if d['totals']['Hours'] < hours_limit * 0.995]
+            
+            if not non_rem_days_under:
+                print(f"  All non-remainder days at 99.5%+ after {swaps_made} swaps")
                 break
             
-            # Determine target for this day
-            remaining_hours_total = sum(item['hours'] for item in remaining_orders)
+            non_rem_days_under.sort(key=lambda x: x[1]['totals']['Hours'])
+            target_day = non_rem_days_under[0][1]
             
-            # Target 100% if there's enough hours, otherwise take what's available
-            if remaining_hours_total >= hours_limit:
-                target_hours = hours_limit
+            hours_needed = hours_limit - target_day['totals']['Hours']
+            if hours_needed < 2:
+                continue
+            
+            # Find best swap between target_day and remainder_day
+            # We want to bring a larger-hours order FROM remainder TO target
+            # And send a smaller-hours order FROM target TO remainder
+            best_swap = None
+            best_score = -float('inf')
+            
+            for item_rem in remainder_day['items']:
+                for item_tgt in target_day['items']:
+                    hours_transfer = item_rem['hours'] - item_tgt['hours']
+                    
+                    if hours_transfer <= 0:
+                        continue  # Need to move hours TO target
+                    
+                    new_target_hours = target_day['totals']['Hours'] + hours_transfer
+                    
+                    # Don't overshoot by too much
+                    if new_target_hours > hours_limit * 1.03:
+                        continue
+                    
+                    # Score based on how close we get to 100%
+                    old_dev = abs(target_day['totals']['Hours'] - hours_limit)
+                    new_dev = abs(new_target_hours - hours_limit)
+                    hours_improvement = old_dev - new_dev
+                    
+                    if hours_improvement <= 0:
+                        continue
+                    
+                    # BALANCE CHECK: Penalize swaps that unbalance remainder
+                    # Check difficulty balance
+                    rem_diff_before = item_rem.get('difficulty', 'Medium')
+                    tgt_diff_before = item_tgt.get('difficulty', 'Medium')
+                    
+                    # Prefer swaps where we exchange similar difficulty
+                    diff_penalty = 0
+                    if rem_diff_before != tgt_diff_before:
+                        diff_penalty = 0.3
+                    
+                    # Check picks balance (prefer similar picks)
+                    picks_diff = abs(item_rem['picks'] - item_tgt['picks'])
+                    picks_penalty = picks_diff * 0.01
+                    
+                    # Check line balance (prefer similar lines)
+                    line_penalty = 0
+                    if item_rem['line'] != item_tgt['line']:
+                        line_penalty = 0.2
+                    
+                    # Combined score
+                    score = hours_improvement - diff_penalty - picks_penalty - line_penalty
+                    
+                    if score > best_score:
+                        # Check offline limits
+                        rem_line = item_rem['order'].get('Suggested Line', '').strip().upper()
+                        tgt_line = item_tgt['order'].get('Suggested Line', '').strip().upper()
+                        
+                        new_rem_offline = remainder_day['offline_count']
+                        new_tgt_offline = target_day['offline_count']
+                        if rem_line == 'OFFLINE':
+                            new_rem_offline -= 1
+                            new_tgt_offline += 1
+                        if tgt_line == 'OFFLINE':
+                            new_tgt_offline -= 1
+                            new_rem_offline += 1
+                        
+                        if new_rem_offline <= offline_limit and new_tgt_offline <= offline_limit:
+                            best_score = score
+                            best_swap = (item_rem, item_tgt, target_day)
+            
+            # Also try swapping with other non-remainder days that are over 100%
+            for i, day_over in enumerate(days[:-1]):
+                if day_over['totals']['Hours'] <= hours_limit:
+                    continue
+                if day_over == target_day:
+                    continue
+                
+                for item_over in day_over['items']:
+                    for item_under in target_day['items']:
+                        hours_transfer = item_over['hours'] - item_under['hours']
+                        
+                        if hours_transfer <= 0:
+                            continue
+                        
+                        new_target_hours = target_day['totals']['Hours'] + hours_transfer
+                        new_over_hours = day_over['totals']['Hours'] - hours_transfer
+                        
+                        if new_target_hours > hours_limit * 1.03:
+                            continue
+                        
+                        old_target_dev = abs(target_day['totals']['Hours'] - hours_limit)
+                        old_over_dev = abs(day_over['totals']['Hours'] - hours_limit)
+                        new_target_dev = abs(new_target_hours - hours_limit)
+                        new_over_dev = abs(new_over_hours - hours_limit)
+                        
+                        improvement = (old_target_dev + old_over_dev) - (new_target_dev + new_over_dev)
+                        
+                        if improvement > best_score:
+                            over_line = item_over['order'].get('Suggested Line', '').strip().upper()
+                            under_line = item_under['order'].get('Suggested Line', '').strip().upper()
+                            
+                            new_over_offline = day_over['offline_count']
+                            new_under_offline = target_day['offline_count']
+                            if over_line == 'OFFLINE':
+                                new_over_offline -= 1
+                                new_under_offline += 1
+                            if under_line == 'OFFLINE':
+                                new_under_offline -= 1
+                                new_over_offline += 1
+                            
+                            if new_over_offline <= offline_limit and new_under_offline <= offline_limit:
+                                best_score = improvement
+                                best_swap = (item_over, item_under, target_day, day_over)
+            
+            if best_swap and best_score > 0.1:
+                if len(best_swap) == 3:
+                    # Swap with remainder
+                    item_rem, item_tgt, tgt_day = best_swap
+                    
+                    self._remove_order_from_day(remainder_day, item_rem)
+                    remainder_day['items'].remove(item_rem)
+                    
+                    self._remove_order_from_day(tgt_day, item_tgt)
+                    tgt_day['items'].remove(item_tgt)
+                    
+                    self._add_order_to_day(remainder_day, item_tgt)
+                    remainder_day['items'].append(item_tgt)
+                    
+                    self._add_order_to_day(tgt_day, item_rem)
+                    tgt_day['items'].append(item_rem)
+                else:
+                    # Swap between two non-remainder days
+                    item_over, item_under, under_day, over_day = best_swap
+                    
+                    self._remove_order_from_day(over_day, item_over)
+                    over_day['items'].remove(item_over)
+                    
+                    self._remove_order_from_day(under_day, item_under)
+                    under_day['items'].remove(item_under)
+                    
+                    self._add_order_to_day(over_day, item_under)
+                    over_day['items'].append(item_under)
+                    
+                    self._add_order_to_day(under_day, item_over)
+                    under_day['items'].append(item_over)
+                
+                swaps_made += 1
             else:
-                target_hours = remaining_hours_total
+                break
+        
+        print("\nAfter hours balancing:")
+        for day in days:
+            pct = day['totals']['Hours'] / hours_limit * 100
+            remainder_tag = " (REMAINDER)" if day['day'] == num_days else ""
+            print(f"  Day {day['day']}: {day['num_orders']} orders, {day['totals']['Hours']:.1f} hours ({pct:.1f}%){remainder_tag}")
+        
+        # ============================================
+        # PHASE 3: Order Count Leveling
+        # ============================================
+        # ============================================
+        # PHASE 3: Order Count Check (skip if already balanced)
+        # ============================================
+        # Round-robin already gives balanced order counts
+        # Only intervene if severely unbalanced, and use SWAPS only (preserve hours)
+        print(f"\n--- Phase 3: Order Count Check ---")
+        
+        order_counts = [d['num_orders'] for d in days]
+        order_spread = max(order_counts) - min(order_counts)
+        print(f"  Order count spread: {order_spread} (min={min(order_counts)}, max={max(order_counts)})")
+        
+        if order_spread <= 3:
+            print(f"  Order counts are balanced, skipping adjustment")
+        else:
+            # Only do a few rounds of balancing swaps
+            max_order_rounds = 10
+            for order_round in range(max_order_rounds):
+                order_counts = [d['num_orders'] for d in days]
+                order_spread = max(order_counts) - min(order_counts)
+                
+                if order_spread <= 3:
+                    break
             
-            day = self._fill_day_progressive(
-                day_num, remaining_orders, target_hours, hours_limit,
-                line_ratios, offline_limit, brand, is_last_day=False
-            )
+            print(f"  Final order count spread: {order_spread}")
+        
+        # Skip the aggressive swapping that was messing up hours
+        # Just report the current state
+        print("\nAfter order count check:")
+        for day in days:
+            print(f"  Day {day['day']}: {day['num_orders']} orders, {day['totals']['Hours']:.1f} hours")
+        
+        
+        # ============================================
+        # PHASE 4: Difficulty Balancing
+        # ============================================
+        # Goal: Each day should have similar AVERAGE difficulty
+        # Swap Hard orders for Easy orders between days to balance
+        print(f"\n--- Phase 4: Difficulty Balancing ---")
+        
+        # Calculate average difficulty across all orders
+        total_difficulty = sum(d['difficulty_sum'] for d in days)
+        target_avg_difficulty = total_difficulty / total_orders if total_orders > 0 else 1.0
+        
+        print(f"  Target avg difficulty per order: {target_avg_difficulty:.3f}")
+        
+        max_difficulty_rounds = 30
+        for diff_round in range(max_difficulty_rounds):
+            # Calculate average difficulty for each day
+            day_avg_difficulties = []
+            for d in days:
+                if d['num_orders'] > 0:
+                    avg = d['difficulty_sum'] / d['num_orders']
+                else:
+                    avg = target_avg_difficulty
+                day_avg_difficulties.append(avg)
             
-            # Remove selected orders from remaining
-            selected_order_nos = {o['Order No'] for o in day['orders']}
-            remaining_orders = [item for item in remaining_orders 
-                              if item['order']['Order No'] not in selected_order_nos]
+            # Find most and least difficult days
+            min_diff_idx = day_avg_difficulties.index(min(day_avg_difficulties))
+            max_diff_idx = day_avg_difficulties.index(max(day_avg_difficulties))
             
-            # Finalize day
+            difficulty_spread = max(day_avg_difficulties) - min(day_avg_difficulties)
+            
+            if difficulty_spread < target_avg_difficulty * 0.15:  # Within 15% spread is acceptable
+                print(f"  Round {diff_round + 1}: Difficulty spread {difficulty_spread:.3f} is acceptable, stopping")
+                break
+            
+            # The day with highest avg difficulty needs easier orders
+            # The day with lowest avg difficulty can take harder orders
+            hard_day = days[max_diff_idx]
+            easy_day = days[min_diff_idx]
+            
+            # Find best swap: move a hard order from hard_day to easy_day
+            # and move an easy order from easy_day to hard_day
+            best_swap = None
+            best_improvement = 0
+            
+            for item_hard in hard_day['items']:
+                if item_hard.get('difficulty') != 'Hard':
+                    continue  # Only consider moving hard orders out
+                    
+                for item_easy in easy_day['items']:
+                    if item_easy.get('difficulty') != 'Easy':
+                        continue  # Only swap with easy orders
+                    
+                    # Calculate what this swap would do to hours
+                    new_hard_day_hours = hard_day['totals']['Hours'] - item_hard['hours'] + item_easy['hours']
+                    new_easy_day_hours = easy_day['totals']['Hours'] - item_easy['hours'] + item_hard['hours']
+                    
+                    # Check if hours would be too far from target
+                    old_hard_dev = abs(hard_day['totals']['Hours'] - hours_limit)
+                    old_easy_dev = abs(easy_day['totals']['Hours'] - hours_limit)
+                    new_hard_dev = abs(new_hard_day_hours - hours_limit)
+                    new_easy_dev = abs(new_easy_day_hours - hours_limit)
+                    
+                    hours_penalty = (new_hard_dev + new_easy_dev) - (old_hard_dev + old_easy_dev)
+                    
+                    # Don't accept swaps that hurt hours too much
+                    if hours_penalty > hours_limit * 0.05:
+                        continue
+                    
+                    # Calculate difficulty improvement
+                    diff_change = item_hard['difficulty_score'] - item_easy['difficulty_score']
+                    
+                    # After swap:
+                    # hard_day loses item_hard, gains item_easy -> lower avg (good)
+                    # easy_day loses item_easy, gains item_hard -> higher avg (acceptable)
+                    
+                    # Score the improvement
+                    improvement = diff_change - hours_penalty * 0.1
+                    
+                    if improvement > best_improvement:
+                        # Check offline limits
+                        hard_line = item_hard['order'].get('Suggested Line', '').strip().upper()
+                        easy_line = item_easy['order'].get('Suggested Line', '').strip().upper()
+                        
+                        new_hard_offline = hard_day['offline_count']
+                        new_easy_offline = easy_day['offline_count']
+                        if hard_line == 'OFFLINE':
+                            new_hard_offline -= 1
+                            new_easy_offline += 1
+                        if easy_line == 'OFFLINE':
+                            new_easy_offline -= 1
+                            new_hard_offline += 1
+                        
+                        if new_hard_offline <= offline_limit and new_easy_offline <= offline_limit:
+                            best_improvement = improvement
+                            best_swap = (item_hard, item_easy)
+            
+            if best_swap and best_improvement > 0.05:
+                item_hard, item_easy = best_swap
+                
+                # Perform the swap
+                self._remove_order_from_day(hard_day, item_hard)
+                hard_day['items'].remove(item_hard)
+                
+                self._remove_order_from_day(easy_day, item_easy)
+                easy_day['items'].remove(item_easy)
+                
+                self._add_order_to_day(hard_day, item_easy)
+                hard_day['items'].append(item_easy)
+                
+                self._add_order_to_day(easy_day, item_hard)
+                easy_day['items'].append(item_hard)
+                
+                if (diff_round + 1) % 10 == 0:
+                    print(f"  Round {diff_round + 1}: Swapped Hard<->Easy, improvement={best_improvement:.3f}")
+            else:
+                # No good swap found
+                if diff_round == 0:
+                    print(f"  No beneficial difficulty swaps found")
+                break
+        
+        # Print difficulty status
+        print("\nAfter difficulty balancing:")
+        for day in days:
+            if day['num_orders'] > 0:
+                avg_diff = day['difficulty_sum'] / day['num_orders']
+                counts = day['difficulty_counts']
+                print(f"  Day {day['day']}: avg_diff={avg_diff:.3f}, "
+                      f"Easy={counts['Easy']}, Med={counts['Medium']}, Hard={counts['Hard']}")
+        
+        # ============================================
+        # PHASE 5: Final Cleanup
+        # ============================================
+        
+        # Remove items list (no longer needed) and finalize
+        for day in days:
+            if 'items' in day:
+                del day['items']
+            
             day['utilization'] = {
                 'Qty': day['totals']['Qty'] / qty_limit * 100 if qty_limit > 0 else 0,
                 'Picks': day['totals']['Picks'] / picks_limit * 100 if picks_limit > 0 else 0,
                 'Hours': day['totals']['Hours'] / hours_limit * 100 if hours_limit > 0 else 0
             }
             day['brand'] = brand
-            day['day_label'] = f"Day {day_num}"
+            day['day_label'] = f"Day {day['day']}"
             day['offline_limit'] = offline_limit
+            day['line_distribution'] = {
+                'C1': {'count': day['line_counts']['C1'], 'hours': day['line_hours']['C1']},
+                'C2': {'count': day['line_counts']['C2'], 'hours': day['line_hours']['C2']},
+                'C3/4': {'count': day['line_counts']['C3/4'], 'hours': day['line_hours']['C3/4']},
+                'Other': {'count': day['line_counts']['Other'], 'hours': day['line_hours']['Other']}
+            }
             
-            print(f"\n--- Day {day_num} ---")
-            print(f"  Orders: {day['num_orders']}")
-            print(f"  Hours: {day['totals']['Hours']:.1f} ({day['utilization']['Hours']:.1f}%)")
-            print(f"  Lines: C1={day['line_counts']['C1']}, C2={day['line_counts']['C2']}, "
-                  f"C3/4={day['line_counts']['C3/4']}, Other={day['line_counts']['Other']}")
-            
+            # Add difficulty info
             if day['num_orders'] > 0:
-                days.append(day)
+                day['avg_difficulty'] = day['difficulty_sum'] / day['num_orders']
+            else:
+                day['avg_difficulty'] = 0
         
-        # If there are remaining orders, add them to the last day
-        if remaining_orders and days:
-            last_day = days[-1]
-            print(f"\n  Adding {len(remaining_orders)} remaining orders to Day {last_day['day']}...")
-            for item in remaining_orders:
-                self._add_order_to_day(last_day, item)
-            
-            # Update last day's metrics
-            last_day['utilization'] = {
-                'Qty': last_day['totals']['Qty'] / qty_limit * 100 if qty_limit > 0 else 0,
-                'Picks': last_day['totals']['Picks'] / picks_limit * 100 if picks_limit > 0 else 0,
-                'Hours': last_day['totals']['Hours'] / hours_limit * 100 if hours_limit > 0 else 0
-            }
-            last_day['line_distribution'] = {
-                'C1': {'count': last_day['line_counts']['C1'], 'hours': last_day['line_hours']['C1']},
-                'C2': {'count': last_day['line_counts']['C2'], 'hours': last_day['line_hours']['C2']},
-                'C3/4': {'count': last_day['line_counts']['C3/4'], 'hours': last_day['line_hours']['C3/4']},
-                'Other': {'count': last_day['line_counts']['Other'], 'hours': last_day['line_hours']['Other']}
-            }
-            print(f"  Day {last_day['day']} final: {last_day['num_orders']} orders, "
-                  f"{last_day['totals']['Hours']:.1f} hours ({last_day['utilization']['Hours']:.1f}%)")
+        # Print final summary
+        print(f"\n{'='*60}")
+        print("FINAL DISTRIBUTION:")
+        print(f"{'='*60}")
+        for day in days:
+            print(f"  Day {day['day']}: {day['num_orders']} orders, "
+                  f"{day['totals']['Hours']:.1f} hours ({day['utilization']['Hours']:.1f}%), "
+                  f"avg_diff={day.get('avg_difficulty', 0):.3f}")
         
         return days
+    
+    def _remove_order_from_day(self, day: Dict, item: Dict):
+        """Helper to remove an order from a day and update all tracking."""
+        order = item['order']
+        if order in day['orders']:
+            day['orders'].remove(order)
+        day['totals']['Qty'] -= item['qty']
+        day['totals']['Picks'] -= item['picks']
+        day['totals']['Hours'] -= item['hours']
+        day['num_orders'] -= 1
+        
+        line = item['line']
+        day['line_counts'][line] -= 1
+        day['line_hours'][line] -= item['hours']
+        
+        order_line_raw = order.get('Suggested Line', '').strip()
+        if order_line_raw.upper() == 'OFFLINE':
+            day['offline_count'] -= 1
+        
+        # Track difficulty
+        if 'difficulty_sum' in day:
+            day['difficulty_sum'] -= item.get('difficulty_score', 0)
+        if 'difficulty_counts' in day and 'difficulty' in item:
+            day['difficulty_counts'][item['difficulty']] -= 1
     
     def _fill_day_progressive(self, day_num: int, available_orders: List[Dict], 
                               target_hours: float, hours_limit: float,
@@ -573,6 +1100,12 @@ class DailyPlanOptimizerProgressive:
         order_line_raw = order.get('Suggested Line', '').strip()
         if order_line_raw.upper() == 'OFFLINE':
             day['offline_count'] += 1
+        
+        # Track difficulty
+        if 'difficulty_sum' in day:
+            day['difficulty_sum'] += item.get('difficulty_score', 0)
+        if 'difficulty_counts' in day and 'difficulty' in item:
+            day['difficulty_counts'][item['difficulty']] += 1
     
     def _create_remainder(self, remaining_orders: List[Dict], hours_limit: float,
                          qty_limit: float, picks_limit: float, 

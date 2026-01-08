@@ -66,11 +66,13 @@
    - Qty and Picks balance around Hours constraint
 
 3. **Difficulty Blending**
-   - Orders are categorized as Easy, Medium, or Difficult based on efficiency metrics
-   - Efficiency metrics: Qty/Hr, Picks/Hr, Picks/Qty (loaded from CSV or calculated)
-   - Target mix: ~30% Easy, ~40% Medium, ~30% Difficult orders
-   - Algorithm blends difficult orders with easy ones to process challenging work
+   - Orders are categorized as Easy, Medium, or Hard based on efficiency metrics
+   - Efficiency metrics: Qty/Hr, Picks/Hr, Picks/Qty (loaded from template or calculated)
+   - **Goal: Each day should have a balanced AVERAGE difficulty**
+   - When a Hard order is included, pair it with Easy orders to balance out
+   - The exact percentage mix doesn't matter - what matters is the average
    - Prevents leaving all difficult orders for the Remainder
+   - Remainder day must also maintain balanced difficulty
 
 ## Prioritization Criteria
 
@@ -94,10 +96,11 @@
    - Helps avoid hitting Qty limit too early
 
 5. **Difficulty Blending**
-   - Orders categorized by efficiency: Easy (high Qty/Hr, low Picks/Qty), Medium, Difficult (low Qty/Hr or high Picks/Qty)
-   - Strong bonus for difficult orders when underrepresented (helps process challenging work)
-   - Prefers medium orders as the "sweet spot"
-   - Ensures a balanced mix rather than leaving all difficult orders for Remainder
+   - Orders categorized by efficiency: Easy (high Qty/Hr, low Picks/Qty), Medium, Hard (low Qty/Hr or high Picks/Qty)
+   - **Goal: Each day should have the same AVERAGE difficulty**
+   - When Hard orders are included, balance with Easy orders
+   - The exact percentage mix (e.g., 30/40/30) doesn't matter - the average does
+   - Ensures a balanced mix across ALL days including Remainder
 
 ## Data Requirements
 
@@ -125,16 +128,24 @@
    - Prioritizes by due date
    - Targets ~40 orders
 
-2. **Multi-Day Planning (Round-Robin with Balancing)**
+2. **Multi-Day Planning (Multi-Round Leveling)**
    - **Phase 1: Round-Robin Distribution**
      - Orders are sorted by start date (earlier first)
      - Distributed across days like dealing cards (order 1→Day1, order 2→Day2, etc.)
-     - This ensures approximately equal order counts per day
+     - This ensures approximately equal order counts, picks, difficulty, and lines per day
    - **Phase 2: Hours Balancing**
-     - Swaps orders between days to balance hours utilization
-     - Moves orders from over-utilized days to under-utilized days
-     - Performs order-for-order swaps when simple moves don't improve balance
-   - **Result**: ALL orders scheduled, NO remainder, balanced hours AND order counts
+     - Maximizes hours on Days 1 to N-1 (target 100% each)
+     - Day N is designated as "Remainder" and can have less hours
+     - Uses swap-based balancing to preserve order count balance
+     - When swapping with remainder, prefers swaps that keep remainder balanced
+   - **Phase 3: Order Count Check**
+     - Verifies order counts are balanced (spread ≤ 3)
+     - Does not modify if already balanced
+   - **Phase 4: Difficulty Balancing**
+     - Ensures each day (including remainder) has similar average difficulty
+     - Swaps Hard orders for Easy orders between days to balance
+     - Target: all days within 15% of target average difficulty
+   - **Result**: Days 1 to N-1 at ~100% hours, Remainder at lower hours but still balanced
    - Days are labeled "Day 1", "Day 2", etc.
 
 3. **Balance Targets**
@@ -174,10 +185,18 @@
    - Limit High Hours Orders
    - Limit Low Hours orders
 
-2. **Remainder Category**
-   - Remainder orders don't need to follow all constraints
-   - Offline limit may be exceeded in Remainder (it's overflow)
-   - Hours target doesn't apply to Remainder
+2. **Remainder Day (Last Day)**
+   - Hours target doesn't apply (can be less than 100%)
+   - **Order count is PROPORTIONAL to hours:**
+     - If remainder is at 80% hours, it gets ~80% of the orders
+     - This leaves room for future orders to top it up
+     - When topped up to 100%, order count will match other days
+   - **Must remain BALANCED in all other dimensions:**
+     - Balanced difficulty mix (Easy/Medium/Hard) - same average as other days
+     - Balanced picks (proportional, not all high-pick or all low-pick orders)
+     - Balanced line distribution
+   - This ensures when new orders arrive to fill the remainder, the day is not unbalanced
+   - Offline limit still applies
 
 3. **Line Balance**
    - 1:1:1 ratio is a target, not always perfectly achievable
