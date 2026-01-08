@@ -1,0 +1,19 @@
+BVI Qty Limit: 10544
+BVI Picks Limit: 750
+BVI Hours Limit: 390
+BVI Low Picks Limit: 15
+BVI Big Picks Limit: 28
+BVI Large Orders Limit: 1000
+BVI Offline Jobs Limit: 28
+
+Malosa Qty Limit: 3335
+Malosa Picks Limit: 130
+Malosa Hours Limit: 90
+
+No Duplicate Parts
+Limit Low Picks Orders
+Limit High Picks Orders
+Limit High Qty Orders
+Limit Low Qty Orders
+Limit High Hours Orders
+Limit Low Hours orders
