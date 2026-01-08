@@ -1,155 +1,205 @@
 """
 Daily Planning Optimizer
 Generates optimal daily plans balancing Qty, Picks, and Hours based on limits.
-Reads from simple CSV data file.
+Reads directly from Excel template file.
 """
 import csv
 import openpyxl
+import os
 from datetime import datetime
 from typing import List, Dict, Tuple
 import json
 
 
 class DailyPlanOptimizer:
-    def __init__(self, data_path: str, limits_path: str = None):
-        """Initialize optimizer with data file."""
-        self.data_path = data_path
-        self.limits_path = limits_path or 'daily_plan_limits.txt'
+    def __init__(self, template_path: str = None):
+        """
+        Initialize optimizer with Excel template file.
+        
+        Args:
+            template_path: Path to Excel template file (default: 'Daily Planning Template.xlsm')
+        """
+        self.template_path = template_path or 'Daily Planning Template.xlsm'
         self.limits = {}
         self.orders = []
+        self.brand_limits = {}
         
     def load_data(self):
-        """Load orders from CSV and limits from file."""
+        """Load orders and limits directly from Excel template."""
         self._load_limits()
         self._load_orders()
         
     def _load_limits(self):
-        """Load brand-specific limits from file."""
-        self.brand_limits = {}
+        """Load brand-specific limits directly from Excel template."""
+        if not os.path.exists(self.template_path):
+            raise FileNotFoundError(f"Template file not found: {self.template_path}")
+        
+        wb = openpyxl.load_workbook(self.template_path, data_only=True)
+        main_sheet = wb['Main']
+        
+        # Extract limits (row 2)
+        headers = [cell.value for cell in main_sheet[1]]
+        limits_row = [cell.value for cell in main_sheet[2]]
+        
+        limits = {}
         try:
-            with open(self.limits_path, 'r') as f:
-                current_brand = None
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
-                    # Check for brand headers
-                    if line.startswith('BVI '):
-                        current_brand = 'BVI'
-                        if 'BVI' not in self.brand_limits:
-                            self.brand_limits['BVI'] = {}
-                    elif line.startswith('Malosa '):
-                        current_brand = 'Malosa'
-                        if 'Malosa' not in self.brand_limits:
-                            self.brand_limits['Malosa'] = {}
-                    
-                    # Parse limit values - check for exact matches first to avoid confusion
-                    if line.startswith(current_brand + ' Qty Limit:') or (not current_brand and 'Qty Limit:' in line and 'BVI' in line):
-                        value = float(line.split(':')[1].strip())
-                        brand = current_brand or 'BVI'
-                        if brand not in self.brand_limits:
-                            self.brand_limits[brand] = {}
-                        self.brand_limits[brand]['Qty'] = value
-                    elif line.startswith(current_brand + ' Picks Limit:') or (not current_brand and 'Picks Limit:' in line and 'BVI' in line and 'Big' not in line and 'Low' not in line):
-                        value = float(line.split(':')[1].strip())
-                        brand = current_brand or 'BVI'
-                        if brand not in self.brand_limits:
-                            self.brand_limits[brand] = {}
-                        self.brand_limits[brand]['Picks'] = value
-                    elif line.startswith(current_brand + ' Hours Limit:') or (not current_brand and 'Hours Limit:' in line and 'BVI' in line):
-                        value = float(line.split(':')[1].strip())
-                        brand = current_brand or 'BVI'
-                        if brand not in self.brand_limits:
-                            self.brand_limits[brand] = {}
-                        self.brand_limits[brand]['Hours'] = value
-                    elif line.startswith(current_brand + ' Low Picks Limit:'):
-                        value = float(line.split(':')[1].strip())
-                        if current_brand:
-                            self.brand_limits[current_brand]['Low Picks'] = value
-                    elif line.startswith(current_brand + ' Big Picks Limit:'):
-                        value = float(line.split(':')[1].strip())
-                        if current_brand:
-                            self.brand_limits[current_brand]['Big Picks'] = value
-                    elif line.startswith(current_brand + ' Large Orders Limit:'):
-                        value = float(line.split(':')[1].strip())
-                        if current_brand:
-                            self.brand_limits[current_brand]['Large Orders'] = value
-                    elif line.startswith(current_brand + ' Offline Jobs Limit:'):
-                        value = float(line.split(':')[1].strip())
-                        if current_brand:
-                            self.brand_limits[current_brand]['Offline Jobs'] = value
-            
-            # Set default limits if not found
-            if 'BVI' not in self.brand_limits:
-                self.brand_limits['BVI'] = {'Qty': 10544, 'Picks': 750, 'Hours': 390}
-            if 'Malosa' not in self.brand_limits:
-                self.brand_limits['Malosa'] = {'Qty': 3335, 'Picks': 130, 'Hours': 90}
-            
-            print(f"Loaded brand limits: {self.brand_limits}")
-            # Keep legacy self.limits for backward compatibility (defaults to BVI)
-            self.limits = self.brand_limits.get('BVI', {})
-        except FileNotFoundError:
-            print(f"Warning: Limits file not found. Using defaults.")
-            self.brand_limits = {
-                'BVI': {'Qty': 10544, 'Picks': 750, 'Hours': 390},
-                'Malosa': {'Qty': 3335, 'Picks': 130, 'Hours': 90}
+            qty_idx = headers.index('Qty')
+            picks_idx = headers.index('Picks')
+            hours_idx = headers.index('Hours')
+            limits = {
+                'Qty': self._parse_float(limits_row[qty_idx]),
+                'Picks': self._parse_float(limits_row[picks_idx]),
+                'Hours': self._parse_float(limits_row[hours_idx])
             }
-            self.limits = self.brand_limits['BVI']
+        except ValueError:
+            print("Warning: Could not extract basic limits")
+        
+        # Extract brand-specific limits (BVI and Malosa)
+        bvi_limits = {}
+        malosa_limits = {}
+        
+        try:
+            # BVI limits are in the main section
+            bvi_limits = {
+                'Qty': limits.get('Qty', 0),
+                'Picks': limits.get('Picks', 0),
+                'Hours': limits.get('Hours', 0),
+            }
+            
+            # Try to get additional BVI limits
+            if 'Low Picks' in headers:
+                try:
+                    bvi_limits['Low Picks'] = self._parse_float(limits_row[headers.index('Low Picks')])
+                except (ValueError, IndexError):
+                    pass
+            if 'Big Picks' in headers:
+                try:
+                    bvi_limits['Big Picks'] = self._parse_float(limits_row[headers.index('Big Picks')])
+                except (ValueError, IndexError):
+                    pass
+            if 'Large Orders' in headers:
+                try:
+                    bvi_limits['Large Orders'] = self._parse_float(limits_row[headers.index('Large Orders')])
+                except (ValueError, IndexError):
+                    pass
+            if 'Offline Jobs' in headers:
+                try:
+                    bvi_limits['Offline Jobs'] = self._parse_float(limits_row[headers.index('Offline Jobs')])
+                except (ValueError, IndexError):
+                    pass
+            
+            # Find Malosa section - look for "Malosa" in headers
+            if 'Malosa' in headers:
+                malosa_start = headers.index('Malosa')
+                # Malosa Qty, Picks, Hours should be in next few columns
+                for i in range(malosa_start, len(headers)):
+                    if headers[i] == 'Qty' and i + 2 < len(limits_row):
+                        malosa_limits = {
+                            'Qty': self._parse_float(limits_row[i]),
+                            'Picks': self._parse_float(limits_row[i+1]),
+                            'Hours': self._parse_float(limits_row[i+2]),
+                        }
+                        break
+        except Exception as e:
+            print(f"Warning: Could not extract brand-specific limits: {e}")
+        
+        # Set defaults if not found
+        if not bvi_limits.get('Qty'):
+            bvi_limits = {'Qty': 10544, 'Picks': 750, 'Hours': 390}
+        if not malosa_limits.get('Qty'):
+            malosa_limits = {'Qty': 3335, 'Picks': 130, 'Hours': 90}
+        
+        self.brand_limits = {
+            'BVI': bvi_limits,
+            'Malosa': malosa_limits
+        }
+        
+        print(f"Loaded brand limits: {self.brand_limits}")
+        # Keep legacy self.limits for backward compatibility (defaults to BVI)
+        self.limits = self.brand_limits.get('BVI', {})
     
     def _load_orders(self):
-        """Load orders from CSV file."""
-        with open(self.data_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                # Convert numeric fields
-                try:
-                    # Normalize line name (C3/4, C3&4 -> C3/4)
-                    suggested_line = row.get('Suggested Line', '').strip()
-                    if suggested_line in ['C3/4', 'C3&4', 'C3/4']:
-                        suggested_line = 'C3/4'
-                    
-                    # Calculate efficiency metrics
-                    qty = self._parse_float(row.get('Lot Size', 0))
-                    picks = self._parse_float(row.get('Picks', 0))
-                    hours = self._parse_float(row.get('Hours', 0))
-                    
-                    # Try to get from CSV, otherwise calculate
-                    qty_per_hr = self._parse_float(row.get('Qty/Hr', 0))
-                    picks_per_hr = self._parse_float(row.get('Picks/Hr', 0))
-                    picks_per_qty = self._parse_float(row.get('Picks/Qty', 0))
-                    
-                    # Calculate if missing
-                    if qty_per_hr == 0 and hours > 0:
-                        qty_per_hr = qty / hours
-                    if picks_per_hr == 0 and hours > 0:
-                        picks_per_hr = picks / hours
-                    if picks_per_qty == 0 and qty > 0:
-                        picks_per_qty = picks / qty
-                    
-                    order = {
-                        'Order No': row.get('Order No', '').strip(),
-                        'Part No': row.get('Part No', '').strip(),
-                        'Brand': row.get('Brand', '').strip(),
-                        'Start Date': self._parse_date(row.get('Start Date', '')),
-                        'Lot Size': qty,
-                        'Picks': picks,
-                        'Hours': hours,
-                        'Country': row.get('Country', '').strip(),
-                        'Wrap Type': row.get('Wrap Type', '').strip(),
-                        'CPU': self._parse_float(row.get('CPU', 0)),
-                        'Suggested Line': suggested_line,
-                        'Qty/Hr': qty_per_hr,
-                        'Picks/Hr': picks_per_hr,
-                        'Picks/Qty': picks_per_qty,
-                    }
-                    
-                    # Only add if we have essential data
-                    if order['Order No'] and order['Part No'] and order['Lot Size'] > 0:
-                        self.orders.append(order)
-                except Exception as e:
-                    print(f"Error processing order {row.get('Order No', 'unknown')}: {e}")
-                    continue
+        """Load orders directly from Excel template."""
+        if not os.path.exists(self.template_path):
+            raise FileNotFoundError(f"Template file not found: {self.template_path}")
+        
+        wb = openpyxl.load_workbook(self.template_path, data_only=True)
+        main_sheet = wb['Main']
+        
+        # Extract order headers (row 11)
+        order_headers = [cell.value for cell in main_sheet[11]]
+        
+        # Extract orders (starting row 12)
+        for row_idx in range(12, main_sheet.max_row + 1):
+            row = [cell.value for cell in main_sheet[row_idx]]
+            if not row[0] or row[0] == 'Order No':
+                continue
+            
+            try:
+                # Build order dict from row
+                row_dict = {}
+                for idx, header in enumerate(order_headers):
+                    if idx < len(row) and header:
+                        value = row[idx]
+                        # Keep datetime as datetime object (don't convert to string)
+                        row_dict[header] = value
+                
+                # Normalize line name (C3/4, C3&4 -> C3/4)
+                suggested_line = str(row_dict.get('Suggested Line', '')).strip()
+                if suggested_line in ['C3/4', 'C3&4']:
+                    suggested_line = 'C3/4'
+                
+                # Calculate efficiency metrics
+                qty = self._parse_float(row_dict.get('Lot Size', 0))
+                picks = self._parse_float(row_dict.get('Picks', 0))
+                hours = self._parse_float(row_dict.get('Hours', 0))
+                
+                # Try to get from Excel, otherwise calculate
+                qty_per_hr = self._parse_float(row_dict.get('Qty/Hr', 0))
+                picks_per_hr = self._parse_float(row_dict.get('Picks/Hr', 0))
+                picks_per_qty = self._parse_float(row_dict.get('Picks/Qty', 0))
+                
+                # Calculate if missing
+                if qty_per_hr == 0 and hours > 0:
+                    qty_per_hr = qty / hours
+                if picks_per_hr == 0 and hours > 0:
+                    picks_per_hr = picks / hours
+                if picks_per_qty == 0 and qty > 0:
+                    picks_per_qty = picks / qty
+                
+                # Parse date - handle both datetime objects and strings
+                start_date = row_dict.get('Start Date')
+                if isinstance(start_date, datetime):
+                    parsed_date = start_date
+                elif start_date:
+                    parsed_date = self._parse_date(str(start_date))
+                else:
+                    parsed_date = None
+                
+                order = {
+                    'Order No': str(row_dict.get('Order No', '')).strip(),
+                    'Part No': str(row_dict.get('Part No', '')).strip(),
+                    'Brand': str(row_dict.get('Brand', '')).strip(),
+                    'Start Date': parsed_date,
+                    'Lot Size': qty,
+                    'Picks': picks,
+                    'Hours': hours,
+                    'Country': str(row_dict.get('Country', '')).strip(),
+                    'Wrap Type': str(row_dict.get('Wrap Type', '')).strip(),
+                    'CPU': self._parse_float(row_dict.get('CPU', 0)),
+                    'Suggested Line': suggested_line,
+                    'Qty/Hr': qty_per_hr,
+                    'Picks/Hr': picks_per_hr,
+                    'Picks/Qty': picks_per_qty,
+                }
+                
+                # Only add if we have essential data
+                if order['Order No'] and order['Part No'] and order['Lot Size'] > 0:
+                    self.orders.append(order)
+            except Exception as e:
+                order_no = row[0] if row else 'unknown'
+                print(f"Error processing order {order_no}: {e}")
+                continue
         
         print(f"Loaded {len(self.orders)} orders")
     
@@ -1350,18 +1400,16 @@ class DailyPlanOptimizer:
                                 row[key] = value
                         writer.writerow(row)
             print(f"Exported to {output_path}")
-        
-        print(f"Exported to {output_path}")
 
 
 def main():
     """Main function to run the optimizer."""
     import sys
     
-    data_path = "daily_plan_data.csv"
-    limits_path = "daily_plan_limits.txt"
+    template_path = "Daily Planning Template.xlsm"
     
-    optimizer = DailyPlanOptimizer(data_path, limits_path)
+    # Load data directly from Excel template
+    optimizer = DailyPlanOptimizer(template_path=template_path)
     optimizer.load_data()
     
     # Automatically determine maximum possible days for each brand
@@ -1440,18 +1488,26 @@ def main():
                         if offline_limit and offline_limit != float('inf'):
                             print(f"Offline Jobs: {offline_count} / {offline_limit:.0f}")
                 
-                # Export with actual number of complete days in filename
-                if num_complete_days > 0:
-                    filename_days = num_complete_days
-                else:
-                    filename_days = len(day_plans)  # Fallback if all are remainder
-                optimizer.export_to_excel(day_plans, f'daily_plan_suggestions_{brand}_{filename_days}days.xlsx')
-                optimizer.export_to_csv(day_plans, f'daily_plan_suggestions_{brand}_{filename_days}days.csv')
+                # Create output directory if it doesn't exist
+                output_dir = 'output'
+                if not os.path.exists(output_dir):
+                    os.makedirs(output_dir)
+                
+                # Generate timestamp in format YYYYMMDDHHMM
+                timestamp = datetime.now().strftime('%Y%m%d%H%M')
+                
+                # Export with timestamped filename
+                brand_lower = brand.lower()
+                excel_filename = f'{timestamp}-{brand_lower}-plan-suggestion.xlsx'
+                
+                excel_path = os.path.join(output_dir, excel_filename)
+                
+                optimizer.export_to_excel(day_plans, excel_path)
             else:
                 print(f"No plans generated for {brand}")
     
     print("\n" + "="*60)
-    print("Done! Check the generated Excel and CSV files for each brand.")
+    print("Done! Check the generated Excel files for each brand.")
     print("="*60)
 
 

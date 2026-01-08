@@ -4,7 +4,8 @@
 
 1. **Hours is the Pivot Metric**
    - Hours MUST be hit (target: 390 hours for BVI, 90 hours for Malosa)
-   - Hours has tight tolerance: 2% (can go slightly over to 5% if needed for line balancing)
+   - **Minimum requirement: 99.5% of hours target** (algorithm will not stop until at least 99.5% is reached)
+   - Hours tolerance: 99.5% to 102% (can go up to 2% over if needed for line balancing)
    - Qty and Picks are flexible and can exceed limits (up to 50% over) to achieve hours target
 
 2. **Brand Separation**
@@ -18,8 +19,10 @@
    - This is a soft target (preference, not hard constraint)
 
 4. **Multi-Day Planning**
-   - Creates as many complete day plans as possible
-   - Each day must hit hours target (within tolerance)
+   - **Automatic**: Always generates plans for all possible days (no command-line argument needed)
+   - **Sequential filling**: Each day is filled to 100% hours before moving to the next day
+   - Each day must reach at least 99.5% of hours target to be considered complete
+   - Days are filled sequentially (Day 1 to 100%, then Day 2 to 100%, etc.)
    - Remaining orders that don't fit into complete days go into "Remainder"
    - Days are labeled "Day 1", "Day 2", etc., with "Remainder" for overflow
 
@@ -28,9 +31,9 @@
 ### Hard Constraints (Must Not Exceed)
 
 1. **Hours Limit**
-   - BVI: 390 hours (can go up to 5% over if needed for line balancing)
-   - Malosa: 90 hours (can go up to 5% over if needed for line balancing)
-   - Primary constraint - must be hit as closely as possible
+   - BVI: 390 hours (must reach at least 99.5%, can go up to 102% if needed for line balancing)
+   - Malosa: 90 hours (must reach at least 99.5%, can go up to 102% if needed for line balancing)
+   - Primary constraint - **must reach at least 99.5%** before algorithm stops
 
 2. **Offline Jobs Limit**
    - BVI: 28 offline jobs maximum per day
@@ -59,8 +62,15 @@
 
 2. **Utilization Balance**
    - Attempts to balance Qty, Picks, and Hours utilization
-   - Hours is prioritized (must hit target)
+   - Hours is prioritized (must hit at least 99.5% of target)
    - Qty and Picks balance around Hours constraint
+
+3. **Difficulty Blending**
+   - Orders are categorized as Easy, Medium, or Difficult based on efficiency metrics
+   - Efficiency metrics: Qty/Hr, Picks/Hr, Picks/Qty (loaded from CSV or calculated)
+   - Target mix: ~30% Easy, ~40% Medium, ~30% Difficult orders
+   - Algorithm blends difficult orders with easy ones to process challenging work
+   - Prevents leaving all difficult orders for the Remainder
 
 ## Prioritization Criteria
 
@@ -83,6 +93,12 @@
    - Bonus for smaller orders when below target count
    - Helps avoid hitting Qty limit too early
 
+5. **Difficulty Blending**
+   - Orders categorized by efficiency: Easy (high Qty/Hr, low Picks/Qty), Medium, Difficult (low Qty/Hr or high Picks/Qty)
+   - Strong bonus for difficult orders when underrepresented (helps process challenging work)
+   - Prefers medium orders as the "sweet spot"
+   - Ensures a balanced mix rather than leaving all difficult orders for Remainder
+
 ## Data Requirements
 
 1. **Order Data (from CSV)**
@@ -94,6 +110,7 @@
    - Picks: Number of picks
    - Hours: Total standard hours (from Main sheet)
    - Suggested Line: C1, C2, C3/4, Offline, etc.
+   - **Efficiency Metrics**: Qty/Hr, Picks/Hr, Picks/Qty (loaded from CSV or calculated automatically)
 
 2. **Limits Data (from limits file)**
    - Brand-specific limits for Qty, Picks, Hours
@@ -109,9 +126,11 @@
    - Targets ~40 orders
 
 2. **Multi-Day Planning**
-   - Creates days sequentially
-   - Each day must be "complete" (at least 50% of hours target)
-   - Stops creating new days when can't fill a complete day
+   - **Automatic**: Always runs in multi-day mode, determines maximum possible days automatically
+   - **Sequential filling**: Fills each day to 100% hours before moving to the next
+   - Each day must reach at least 99.5% of hours target to be considered complete
+   - Algorithm continues until no more complete days can be created
+   - Stops creating new days when can't fill a day to at least 99.5% of hours target
    - Puts all remaining orders in "Remainder"
 
 3. **Line Balancing**
@@ -163,17 +182,19 @@
 # Extract data from template
 python extract_data.py
 
-# Single day planning
+# Run optimizer (automatically generates all possible days)
 python daily_plan_optimizer.py
-
-# Multi-day planning (creates as many complete days as possible)
-python daily_plan_optimizer.py 5  # Try up to 5 days
 ```
+
+**Note**: The optimizer now automatically determines and generates plans for all possible days. No command-line arguments needed.
 
 ## Notes
 
 - The optimizer uses a greedy algorithm with scoring
-- It prioritizes hours target above all else
+- **Hours target is the absolute priority**: Algorithm will not stop until at least 99.5% of hours target is reached
+- Multi-day planning fills days sequentially to 100% before moving to the next day
+- Difficulty blending ensures challenging orders are processed throughout the plan, not just left for Remainder
 - Line balance and order count are secondary priorities
 - Due dates are used for tie-breaking and initial ordering
 - The system is designed to be flexible with Qty/Picks to ensure hours target is met
+- Efficiency metrics (Qty/Hr, Picks/Hr, Picks/Qty) are used to categorize orders and create balanced difficulty mixes
