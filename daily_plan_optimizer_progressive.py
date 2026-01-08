@@ -398,13 +398,37 @@ class DailyPlanOptimizerProgressive:
         orders_with_metrics.sort(key=lambda x: (x['start_date'], -x['hours']))
         
         # ============================================
-        # PHASE 1: Round-Robin Initial Distribution
+        # PHASE 1: Proportional Distribution
         # ============================================
-        print(f"\n--- Phase 1: Round-Robin Distribution ---")
+        print(f"\n--- Phase 1: Proportional Distribution ---")
+        
+        # Calculate target orders per day
+        # Non-remainder days get full share, remainder day gets proportional share
+        # This leaves room for future orders to top up the remainder
+        
+        remainder_hours_ratio = remainder_hours / hours_limit if hours_limit > 0 else 1.0
+        
+        # Calculate orders for each day
+        # Days 1 to N-1: equal share of (total - remainder's proportional share)
+        # Day N (remainder): proportional to its hours ratio
+        
+        if num_days > 1 and remainder_hours > 0:
+            # Remainder day should have orders proportional to its hours
+            remainder_target_orders = int(target_orders_per_day * remainder_hours_ratio)
+            non_remainder_total_orders = total_orders - remainder_target_orders
+            orders_per_non_remainder = non_remainder_total_orders / (num_days - 1)
+            
+            print(f"  Remainder day will be at ~{remainder_hours_ratio*100:.1f}% hours")
+            print(f"  Giving remainder ~{remainder_target_orders} orders (proportional)")
+            print(f"  Other days get ~{orders_per_non_remainder:.1f} orders each")
+        else:
+            remainder_target_orders = int(target_orders_per_day)
+            orders_per_non_remainder = target_orders_per_day
         
         # Initialize days
         days = []
         for day_num in range(1, num_days + 1):
+            is_remainder = (day_num == num_days)
             days.append({
                 'day': day_num,
                 'orders': [],
@@ -416,17 +440,44 @@ class DailyPlanOptimizerProgressive:
                 'offline_count': 0,
                 'difficulty_sum': 0.0,  # Sum of difficulty scores for averaging
                 'difficulty_counts': {'Easy': 0, 'Medium': 0, 'Hard': 0},
+                'is_remainder': is_remainder,
+                'target_orders': remainder_target_orders if is_remainder else int(orders_per_non_remainder),
             })
         
-        # Round-robin distribution (like dealing cards)
-        for idx, item in enumerate(orders_with_metrics):
-            day_idx = idx % num_days
-            self._add_order_to_day(days[day_idx], item)
-            days[day_idx]['items'].append(item)
+        # Distribute orders - round-robin but skip remainder more often
+        # This gives remainder proportionally fewer orders
+        order_idx = 0
+        day_idx = 0
+        remainder_day_idx = num_days - 1
         
-        print("After round-robin distribution:")
+        while order_idx < len(orders_with_metrics):
+            item = orders_with_metrics[order_idx]
+            current_day = days[day_idx]
+            
+            # Check if this day can accept more orders
+            if current_day['num_orders'] < current_day['target_orders']:
+                self._add_order_to_day(current_day, item)
+                current_day['items'].append(item)
+                order_idx += 1
+            
+            # Move to next day
+            day_idx = (day_idx + 1) % num_days
+            
+            # If we've gone through all days and none can accept, force add to least full
+            if order_idx < len(orders_with_metrics):
+                all_full = all(d['num_orders'] >= d['target_orders'] for d in days)
+                if all_full:
+                    # Find day with fewest orders relative to target
+                    min_ratio_day = min(days, key=lambda d: d['num_orders'] / d['target_orders'] if d['target_orders'] > 0 else float('inf'))
+                    item = orders_with_metrics[order_idx]
+                    self._add_order_to_day(min_ratio_day, item)
+                    min_ratio_day['items'].append(item)
+                    order_idx += 1
+        
+        print("\nAfter proportional distribution:")
         for day in days:
-            print(f"  Day {day['day']}: {day['num_orders']} orders, {day['totals']['Hours']:.1f} hours")
+            tag = " (REMAINDER)" if day.get('is_remainder') else ""
+            print(f"  Day {day['day']}: {day['num_orders']} orders, {day['totals']['Hours']:.1f} hours{tag}")
         
         # ============================================
         # PHASE 2: Balanced Hours Optimization

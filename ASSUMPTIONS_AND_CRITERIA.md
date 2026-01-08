@@ -187,12 +187,15 @@
 
 2. **Remainder Day (Last Day)**
    - Hours target doesn't apply (can be less than 100%)
-   - **BUT must remain BALANCED in all other dimensions:**
-     - Similar order count to other days
-     - Balanced difficulty mix (Easy/Medium/Hard)
-     - Balanced picks (not all high-pick or all low-pick orders)
+   - **Order count is PROPORTIONAL to hours:**
+     - If remainder is at 80% hours, it gets ~80% of the orders
+     - This leaves room for future orders to top it up
+     - When topped up to 100%, order count will match other days
+   - **Must remain BALANCED in all other dimensions:**
+     - Balanced difficulty mix (Easy/Medium/Hard) - same average as other days
+     - Balanced picks (proportional, not all high-pick or all low-pick orders)
      - Balanced line distribution
-   - This ensures when new orders arrive to fill the remainder, it's not unbalanced
+   - This ensures when new orders arrive to fill the remainder, the day is not unbalanced
    - Offline limit still applies
 
 3. **Line Balance**
