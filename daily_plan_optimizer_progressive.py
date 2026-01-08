@@ -429,37 +429,157 @@ class DailyPlanOptimizerProgressive:
             print(f"  Day {day['day']}: {day['num_orders']} orders, {day['totals']['Hours']:.1f} hours")
         
         # ============================================
-        # PHASE 2: Hours Balancing via Swaps
+        # PHASE 2: Hours Balancing - Maximize Days 1 to N-1
         # ============================================
-        print(f"\n--- Phase 2: Hours Balancing via Swaps ---")
+        print(f"\n--- Phase 2: Hours Balancing (Maximize non-remainder days) ---")
         
-        # Strategy: Try to get days 1 through N-1 as close to 100% as possible
-        # Day N (last day) is the "remainder" day
-        # We allow order count variance of up to 20% to achieve better hours balance
+        # Strategy: 
+        # 1. Days 1 to N-1 should be as close to 100% as possible
+        # 2. Day N (last day) is the "remainder" - can have less hours AND fewer orders
+        # 3. Move orders FROM remainder day TO under-filled days
         
-        max_order_variance = int(target_orders_per_day * 0.25)  # Allow 25% variance in order count
+        remainder_day_idx = num_days - 1  # Last day is remainder
+        remainder_day = days[remainder_day_idx]
+        non_remainder_days = days[:remainder_day_idx]
         
-        # First, try to balance hours across ALL days (excluding moving to/from last day excessively)
+        print(f"  Remainder day: Day {remainder_day['day']}")
+        print(f"  Target: Maximize hours on Days 1-{remainder_day_idx}")
+        
+        # Phase 2a: Move orders FROM remainder TO under-filled days
+        max_move_rounds = 200
+        moves_made = 0
+        for move_round in range(max_move_rounds):
+            # Find the non-remainder day most under 100%
+            under_days = [(i, d) for i, d in enumerate(non_remainder_days) 
+                         if d['totals']['Hours'] < hours_limit * 0.995]
+            
+            if not under_days:
+                print(f"  All non-remainder days at 99.5%+ after {moves_made} moves")
+                break
+            
+            # Sort by how much under they are
+            under_days.sort(key=lambda x: x[1]['totals']['Hours'])
+            target_day_idx, target_day = under_days[0]
+            
+            hours_needed = hours_limit - target_day['totals']['Hours']
+            
+            if hours_needed < 1:
+                break
+            
+            # Find best order to move from remainder to this day
+            best_order = None
+            best_fit_score = -float('inf')
+            
+            for item in remainder_day['items']:
+                # How well does this order fit the gap?
+                if item['hours'] <= hours_needed * 1.05:  # Allow slight overage
+                    # Prefer orders that fill more of the gap
+                    fit_score = item['hours'] / hours_needed if hours_needed > 0 else 0
+                    # Bonus for orders that get us close to 100%
+                    new_hours = target_day['totals']['Hours'] + item['hours']
+                    if new_hours >= hours_limit * 0.99 and new_hours <= hours_limit * 1.02:
+                        fit_score += 1.0
+                    
+                    if fit_score > best_fit_score:
+                        # Check offline limit
+                        item_line = item['order'].get('Suggested Line', '').strip().upper()
+                        new_target_offline = target_day['offline_count'] + (1 if item_line == 'OFFLINE' else 0)
+                        
+                        if new_target_offline <= offline_limit:
+                            best_fit_score = fit_score
+                            best_order = item
+            
+            if best_order:
+                # Move the order
+                self._remove_order_from_day(remainder_day, best_order)
+                remainder_day['items'].remove(best_order)
+                
+                self._add_order_to_day(target_day, best_order)
+                target_day['items'].append(best_order)
+                moves_made += 1
+            else:
+                # No single order fits - try swapping
+                # Find a large order in remainder and a small order in target to swap
+                best_swap = None
+                best_swap_score = -float('inf')
+                
+                for item_remainder in remainder_day['items']:
+                    for item_target in target_day['items']:
+                        hours_transfer = item_remainder['hours'] - item_target['hours']
+                        
+                        if hours_transfer > 0:  # We want to move hours TO target
+                            new_target_hours = target_day['totals']['Hours'] + hours_transfer
+                            
+                            # Check if this gets target closer to 100%
+                            old_dev = abs(target_day['totals']['Hours'] - hours_limit)
+                            new_dev = abs(new_target_hours - hours_limit)
+                            
+                            if new_dev < old_dev and new_target_hours <= hours_limit * 1.02:
+                                improvement = old_dev - new_dev
+                                
+                                # Check offline limits
+                                rem_line = item_remainder['order'].get('Suggested Line', '').strip().upper()
+                                tgt_line = item_target['order'].get('Suggested Line', '').strip().upper()
+                                
+                                new_rem_offline = remainder_day['offline_count']
+                                new_tgt_offline = target_day['offline_count']
+                                if rem_line == 'OFFLINE':
+                                    new_rem_offline -= 1
+                                    new_tgt_offline += 1
+                                if tgt_line == 'OFFLINE':
+                                    new_tgt_offline -= 1
+                                    new_rem_offline += 1
+                                
+                                if new_rem_offline <= offline_limit and new_tgt_offline <= offline_limit:
+                                    if improvement > best_swap_score:
+                                        best_swap_score = improvement
+                                        best_swap = (item_remainder, item_target)
+                
+                if best_swap and best_swap_score > 0.1:
+                    item_rem, item_tgt = best_swap
+                    
+                    self._remove_order_from_day(remainder_day, item_rem)
+                    remainder_day['items'].remove(item_rem)
+                    
+                    self._remove_order_from_day(target_day, item_tgt)
+                    target_day['items'].remove(item_tgt)
+                    
+                    self._add_order_to_day(remainder_day, item_tgt)
+                    remainder_day['items'].append(item_tgt)
+                    
+                    self._add_order_to_day(target_day, item_rem)
+                    target_day['items'].append(item_rem)
+                    moves_made += 1
+                else:
+                    # Move to next under-filled day
+                    if len(under_days) > 1:
+                        continue
+                    break
+        
+        # Phase 2b: Balance hours among non-remainder days
+        print(f"  Balancing hours among Days 1-{remainder_day_idx}...")
         max_swap_rounds = 100
         for swap_round in range(max_swap_rounds):
-            # Sort days by hours (excluding last day for now)
-            day_hours = [(i, d['totals']['Hours'], d['num_orders']) for i, d in enumerate(days)]
+            # Find most over and under among non-remainder days
+            day_hours = [(i, d['totals']['Hours']) for i, d in enumerate(non_remainder_days)]
             day_hours.sort(key=lambda x: x[1])
+            
+            if len(day_hours) < 2:
+                break
             
             most_under_idx = day_hours[0][0]
             most_over_idx = day_hours[-1][0]
             
             hours_spread = day_hours[-1][1] - day_hours[0][1]
             
-            # Stop if spread is acceptable
-            if hours_spread < hours_limit * 0.08:  # Within 8% spread
-                print(f"  Round {swap_round + 1}: Hours spread {hours_spread:.1f} is acceptable")
+            if hours_spread < hours_limit * 0.03:  # Within 3% spread among non-remainder
+                print(f"  Non-remainder days balanced (spread: {hours_spread:.1f})")
                 break
             
-            day_under = days[most_under_idx]
-            day_over = days[most_over_idx]
+            day_under = non_remainder_days[most_under_idx]
+            day_over = non_remainder_days[most_over_idx]
             
-            # Try swapping to improve hours balance
+            # Try swapping
             best_swap = None
             best_score = -float('inf')
             
@@ -468,16 +588,14 @@ class DailyPlanOptimizerProgressive:
                     new_over_hours = day_over['totals']['Hours'] - item_over['hours'] + item_under['hours']
                     new_under_hours = day_under['totals']['Hours'] - item_under['hours'] + item_over['hours']
                     
-                    # Calculate improvement in hours deviation
                     old_over_dev = abs(day_over['totals']['Hours'] - hours_limit)
                     old_under_dev = abs(day_under['totals']['Hours'] - hours_limit)
                     new_over_dev = abs(new_over_hours - hours_limit)
                     new_under_dev = abs(new_under_hours - hours_limit)
                     
-                    hours_improvement = (old_over_dev + old_under_dev) - (new_over_dev + new_under_dev)
+                    improvement = (old_over_dev + old_under_dev) - (new_over_dev + new_under_dev)
                     
-                    if hours_improvement > 0:
-                        # Check offline limits
+                    if improvement > best_score:
                         over_line = item_over['order'].get('Suggested Line', '').strip().upper()
                         under_line = item_under['order'].get('Suggested Line', '').strip().upper()
                         
@@ -491,9 +609,8 @@ class DailyPlanOptimizerProgressive:
                             new_over_offline += 1
                         
                         if new_over_offline <= offline_limit and new_under_offline <= offline_limit:
-                            if hours_improvement > best_score:
-                                best_score = hours_improvement
-                                best_swap = (item_over, item_under)
+                            best_score = improvement
+                            best_swap = (item_over, item_under)
             
             if best_swap and best_score > 0.1:
                 item_over, item_under = best_swap
@@ -510,50 +627,13 @@ class DailyPlanOptimizerProgressive:
                 self._add_order_to_day(day_under, item_over)
                 day_under['items'].append(item_over)
             else:
-                # Try moving orders (allows order count to change slightly)
-                best_move = None
-                best_move_score = -float('inf')
-                
-                # Check if order counts allow a move
-                can_move = (day_over['num_orders'] > target_orders_per_day - max_order_variance and
-                           day_under['num_orders'] < target_orders_per_day + max_order_variance)
-                
-                if can_move:
-                    for item in day_over['items']:
-                        new_over_hours = day_over['totals']['Hours'] - item['hours']
-                        new_under_hours = day_under['totals']['Hours'] + item['hours']
-                        
-                        old_over_dev = abs(day_over['totals']['Hours'] - hours_limit)
-                        old_under_dev = abs(day_under['totals']['Hours'] - hours_limit)
-                        new_over_dev = abs(new_over_hours - hours_limit)
-                        new_under_dev = abs(new_under_hours - hours_limit)
-                        
-                        improvement = (old_over_dev + old_under_dev) - (new_over_dev + new_under_dev)
-                        
-                        if improvement > best_move_score:
-                            item_line = item['order'].get('Suggested Line', '').strip().upper()
-                            new_under_offline = day_under['offline_count'] + (1 if item_line == 'OFFLINE' else 0)
-                            
-                            if new_under_offline <= offline_limit:
-                                best_move_score = improvement
-                                best_move = item
-                    
-                    if best_move and best_move_score > 0.5:
-                        self._remove_order_from_day(day_over, best_move)
-                        day_over['items'].remove(best_move)
-                        
-                        self._add_order_to_day(day_under, best_move)
-                        day_under['items'].append(best_move)
-                        continue
-                
-                # No improvement possible
-                if swap_round == 0:
-                    print(f"  No beneficial swaps found in initial pass")
                 break
         
         print("\nAfter hours balancing:")
         for day in days:
-            print(f"  Day {day['day']}: {day['num_orders']} orders, {day['totals']['Hours']:.1f} hours")
+            pct = day['totals']['Hours'] / hours_limit * 100
+            remainder_tag = " (REMAINDER)" if day['day'] == num_days else ""
+            print(f"  Day {day['day']}: {day['num_orders']} orders, {day['totals']['Hours']:.1f} hours ({pct:.1f}%){remainder_tag}")
         
         # ============================================
         # PHASE 3: Order Count Leveling
